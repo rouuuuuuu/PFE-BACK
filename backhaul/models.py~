@@ -1,0 +1,27 @@
+from django.db import models
+
+class BackhaulLink(models.Model):
+
+    DEVICE_TYPE_CHOICES = [
+        ('huawei',  'Huawei VRP'),
+        ('cisco',   'Cisco IOS'),
+        ('juniper', 'Juniper JunOS'),
+    ]
+
+    STATUS_CHOICES = [
+        ('pending',  'En attente'),
+        ('running',  'En cours'),
+        ('active',   'Actif'),
+        ('failed',   'Échoué'),
+    ]
+
+    name        = models.CharField(max_length=100)
+    ip_address  = models.GenericIPAddressField()
+    bandwidth   = models.IntegerField(help_text="Mbps")
+    device_type = models.CharField(max_length=20, choices=DEVICE_TYPE_CHOICES, default='huawei')
+    status      = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at  = models.DateTimeField(auto_now_add=True)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.name} — {self.ip_address} ({self.status})'
