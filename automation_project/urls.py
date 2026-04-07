@@ -29,5 +29,8 @@ urlpatterns = [
     path('api/ping/' , ping),
     path('api/backhaul/', include('backhaul.urls')),
     path('api/', include('devices.urls')),
+    path('api/provisioning/', include('provisioning.urls')),
+    path('api/reporting/', include('reporting.urls')),
 ]
+
 

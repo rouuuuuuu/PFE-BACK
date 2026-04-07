@@ -53,7 +53,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware', # doit être EN PREMIER
+'corsheaders.middleware.CorsMiddleware', # doit être EN PREMIER
 'django.middleware.security.SecurityMiddleware',
 'django.contrib.sessions.middleware.SessionMiddleware',
 'django.middleware.common.CommonMiddleware',
@@ -66,11 +66,23 @@ CORS_ALLOWED_ORIGINS = [
 'http://localhost:4200', # Angular dev server (Windows)
 ]
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = True  # ← add this line
 # ── Celery + Redis ──
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
+from celery.schedules import crontab
+
+# ... your existing celery settings ...
+
+CELERY_BEAT_SCHEDULE = {
+    'generate-monthly-report-on-the-1st': {
+        'task': 'reporting.tasks.generate_monthly_network_report',
+        # Run at 00:05 AM on the 1st day of every month
+        'schedule': crontab(minute=5, hour=0, day_of_month=1),
+    },
+}
 # ── Django REST Framework ──
 REST_FRAMEWORK = {
 'DEFAULT_AUTHENTICATION_CLASSES': [
@@ -80,7 +92,7 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.AllowAny',
     ],
  'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend']
-
+ # 'PAGE_SIZE': 300, #------------------------------------------
 }
 
 ROOT_URLCONF = 'automation_project.urls'
@@ -117,11 +129,6 @@ DATABASES = {
 }
 }
 # settings.py
-
-REST_FRAMEWORK = {
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 50, # Angular will receive 50 records per page
-}
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators

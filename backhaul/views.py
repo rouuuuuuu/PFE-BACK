@@ -7,4 +7,4 @@ class BackhaulLinkViewSet(viewsets.ModelViewSet):
     queryset = BackhaulLink.objects.all().order_by('-imported_at')
     serializer_class = BackhaulLinkSerializer
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ['alarm_severity', 'status'] # Filter links by alarm severity
+    filterset_fields = ['alarm_severity', 'link_type'] # Filter links by alarm severity
