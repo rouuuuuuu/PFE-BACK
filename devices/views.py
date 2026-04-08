@@ -53,25 +53,50 @@ class HardwareVerifyView(APIView):
             )
 
         # 2. Query related hardware using 'ne_name' as the linking key
-        # We match the device.name to the ne_name in the hardware tables
         ports = Port.objects.filter(ne_name=device.name)
         cards = Card.objects.filter(ne_name=device.name)
         sfps = SFP.objects.filter(ne_name=device.name)
 
-        # 3. Calculate status logic based on your specific STATUS_CHOICES
-        # Port is bad if oper_status is 'down'
-        ports_ok = not ports.filter(oper_status='down').exists()
-        
-        # Card is bad if board_status is 'abnormal'
-        cards_ok = not cards.filter(board_status='abnormal').exists()
-        
-        # SFP is bad if either rx_status or tx_status is 'abnormal'
-        sfps_ok = not (sfps.filter(rx_status='abnormal').exists() or 
-                       sfps.filter(tx_status='abnormal').exists())
+        # 3. Calculate status logic
+        ports_ok = not ports.filter(oper_status__iexact='down').exists()
+        cards_ok = not cards.filter(board_status__iexact='abnormal').exists()
+        sfps_ok = not (sfps.filter(rx_status__iexact='abnormal').exists() or 
+                       sfps.filter(tx_status__iexact='abnormal').exists())
 
-        # 4. Construct the summary response
         overall_ok = all([ports_ok, cards_ok, sfps_ok])
-        
+
+        # 4. Extract Detailed Lists for Angular
+        port_details = []
+        for p in ports:
+            port_details.append({
+                # Adjust 'port_name' and 'description' if your model fields are named differently
+                "name": getattr(p, 'port_name', getattr(p, 'name', 'Unknown')),
+                "status": getattr(p, 'oper_status', 'unknown').lower(),
+                "description": getattr(p, 'port_description', getattr(p, 'description', 'N/A'))
+            })
+
+        card_details = []
+        for c in cards:
+            card_details.append({
+                "name": getattr(c, 'board_name', getattr(c, 'name', 'Unknown')),
+                "status": getattr(c, 'board_status', 'unknown').lower(),
+                "description": f"Type: {getattr(c, 'board_type', 'N/A')}"
+            })
+
+        sfp_details = []
+        for s in sfps:
+            # SFP status depends on both RX and TX
+            rx = getattr(s, 'rx_status', 'unknown').lower()
+            tx = getattr(s, 'tx_status', 'unknown').lower()
+            status_val = 'abnormal' if rx == 'abnormal' or tx == 'abnormal' else 'normal'
+            
+            sfp_details.append({
+                "name": getattr(s, 'port_name', getattr(s, 'name', 'Unknown')),
+                "status": status_val,
+                "description": f"Speed: {getattr(s, 'speed', 'N/A')} | Vendor: {getattr(s, 'manufacturer', 'N/A')}"
+            })
+
+        # 5. Construct the final response
         return Response({
             "device_name": device.name,
             "device_ip": device.loopback_ip,
@@ -86,8 +111,13 @@ class HardwareVerifyView(APIView):
                 "total_ports": ports.count(),
                 "total_cards": cards.count(),
                 "total_sfps": sfps.count()
-            }
+            },
+            # These are the new arrays Angular will use!
+            "port_details": port_details,
+            "card_details": card_details,
+            "sfp_details": sfp_details
         }, status=status.HTTP_200_OK)
+     
 class DashboardStatsView(APIView):
     """
     GET /api/dashboard/stats/
