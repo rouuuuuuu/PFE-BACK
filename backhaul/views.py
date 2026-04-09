@@ -8,8 +8,8 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 def import_isis_links(request):
     """
-    Handles CSV upload, cleans incoming data, and performs a 
-    global cleanup of existing records.
+    Handles CSV upload, cleans incoming data, normalizes GE to 1GE,
+    and performs a global cleanup of existing records.
     """
     if request.method == 'POST' and request.FILES.get('csv_file'):
         csv_file = request.FILES['csv_file']
@@ -28,6 +28,11 @@ def import_isis_links(request):
                 raw_source = row.get('Source Port', '').strip()
                 raw_sink = row.get('Sink Port', '').strip()
 
+                # Extract Link Level and normalize 'GE' to '1GE'
+                raw_level = row.get('Link Level', '').strip()
+                if raw_level.upper() == 'GE':
+                    raw_level = '1GE'
+
                 # Clean incoming strings for this row
                 clean_source = raw_source.split('(')[1].split(')')[0] if '(' in raw_source else raw_source
                 clean_sink = raw_sink.split('(')[1].split(')')[0] if '(' in raw_sink else raw_sink
@@ -40,7 +45,9 @@ def import_isis_links(request):
                         'source_port': clean_source,
                         'sink_ne': row.get('Sink NE', '').strip(),
                         'sink_port': clean_sink,
+                        'link_level': raw_level, # Saves 1GE or whatever was in the CSV
                         'link_rate': row.get('Link Rate(bit/s)', '0').strip(),
+                        'link_type': row.get('Link Type', '').strip(),
                     }
                 )
                 imported_count += 1
@@ -48,17 +55,24 @@ def import_isis_links(request):
                 print(f"Error processing row: {str(e)}")
                 continue
 
-        # 2. Global Cleanup (The logic you provided)
+        # 2. Global Cleanup (The logic you provided + the new GE logic)
         # This ensures any records already in the DB are also cleaned
         all_links = BackhaulLink.objects.all()
         cleaned_in_db = 0
         for link in all_links:
             changed = False
+            
+            # Clean ports
             if link.source_port and '(' in link.source_port:
                 link.source_port = link.source_port.split('(')[1].split(')')[0]
                 changed = True
             if link.sink_port and '(' in link.sink_port:
                 link.sink_port = link.sink_port.split('(')[1].split(')')[0]
+                changed = True
+            
+            # Clean old 'GE' link levels in the database
+            if link.link_level and link.link_level.upper() == 'GE':
+                link.link_level = '1GE'
                 changed = True
             
             if changed:

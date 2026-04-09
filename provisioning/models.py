@@ -17,10 +17,15 @@ class ProvisioningTask(models.Model):
         ('voip',     'VoIP Service'),
         ('mpls',     'MPLS'),
         ('vpn',      'VPN'),
+        # --- NOUVEAUX CHOIX AJOUTÉS POUR ANGULAR ---
+        ('configure_vlan', 'Configure VLAN'),
+        ('firmware_upgrade', 'Firmware Upgrade'),
+        ('push_acl', 'Push ACL'),
     ]
 
     device_name    = models.CharField(max_length=100)
     device_ip      = models.GenericIPAddressField()
+    # max_length=20 est suffisant car "firmware_upgrade" fait 16 caractères
     task_type      = models.CharField(max_length=20, choices=TYPE_CHOICES)
     status         = models.CharField(max_length=20, choices=STATUS_CHOICES, default='queued')
     celery_task_id = models.CharField(max_length=100, blank=True)

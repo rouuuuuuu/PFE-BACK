@@ -65,14 +65,17 @@ class HardwareVerifyView(APIView):
 
         overall_ok = all([ports_ok, cards_ok, sfps_ok])
 
-        # 4. Extract Detailed Lists for Angular
+     # 4. Extract Detailed Lists for Angular
         port_details = []
         for p in ports:
             port_details.append({
-                # Adjust 'port_name' and 'description' if your model fields are named differently
                 "name": getattr(p, 'port_name', getattr(p, 'name', 'Unknown')),
                 "status": getattr(p, 'oper_status', 'unknown').lower(),
-                "description": getattr(p, 'port_description', getattr(p, 'description', 'N/A'))
+                "description": getattr(p, 'port_description', getattr(p, 'description', 'N/A')),
+                # --- NEW FIELDS FOR ANGULAR ---
+                "rate": getattr(p, 'port_rate_kbits', 'N/A'),
+                "admin_status": getattr(p, 'administrative_status', 'N/A'),
+                "port_type": getattr(p, 'port_type', 'N/A')
             })
 
         card_details = []
@@ -80,7 +83,12 @@ class HardwareVerifyView(APIView):
             card_details.append({
                 "name": getattr(c, 'board_name', getattr(c, 'name', 'Unknown')),
                 "status": getattr(c, 'board_status', 'unknown').lower(),
-                "description": f"Type: {getattr(c, 'board_type', 'N/A')}"
+                "description": f"Type: {getattr(c, 'board_type', 'N/A')}",
+                # --- NEW FIELDS FOR ANGULAR ---
+                "board_type": getattr(c, 'board_type', 'N/A'),
+                "hardware_version": getattr(c, 'hardware_version', 'N/A'),
+                "software_version": getattr(c, 'software_version', 'N/A'),
+                "serial_number": getattr(c, 'sn_bar_code', getattr(c, 'serial_number', 'N/A'))
             })
 
         sfp_details = []
@@ -93,7 +101,13 @@ class HardwareVerifyView(APIView):
             sfp_details.append({
                 "name": getattr(s, 'port_name', getattr(s, 'name', 'Unknown')),
                 "status": status_val,
-                "description": f"Speed: {getattr(s, 'speed', 'N/A')} | Vendor: {getattr(s, 'manufacturer', 'N/A')}"
+                "description": f"Speed: {getattr(s, 'speed', 'N/A')} | Vendor: {getattr(s, 'manufacturer', 'N/A')}",
+                # --- NEW FIELDS FOR ANGULAR ---
+                "speed": getattr(s, 'speed_mbs', getattr(s, 'speed', 'N/A')),
+                "vendor": getattr(s, 'manufacturer', getattr(s, 'vendor', 'N/A')),
+                "rx_power": getattr(s, 'receive_optical_power_dbm', getattr(s, 'rx_power', 'N/A')),
+                "tx_power": getattr(s, 'transmit_optical_power_dbm', getattr(s, 'tx_power', 'N/A')),
+                "optical_type": getattr(s, 'fiber_type', getattr(s, 'optical_type', 'N/A'))
             })
 
         # 5. Construct the final response
