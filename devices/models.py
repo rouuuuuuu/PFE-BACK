@@ -6,6 +6,8 @@ class Router(models.Model):
         ('cisco',   'Cisco'),
         ('juniper', 'Juniper'),
     ]
+    ssh_username = models.CharField(max_length=100, null=True, blank=True)
+    ssh_password = models.CharField(max_length=100, null=True, blank=True)
 
     name        = models.CharField(max_length=100, unique=True)
     loopback_ip = models.GenericIPAddressField(unique=True)
@@ -19,8 +21,7 @@ class Router(models.Model):
 
     class Meta:
         ordering = ['name']
-
-
+    
 class Switch(models.Model):
     name           = models.CharField(max_length=100, unique=True)
     loopback_ip    = models.GenericIPAddressField(unique=True)
