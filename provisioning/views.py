@@ -1,46 +1,36 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, viewsets
+from rest_framework.decorators import api_view
+from django.shortcuts import get_object_or_404
+from django.db import transaction
 
 from .serializers import ProvisioningTaskSerializer
-from .tasks import execute_bandwidth_upgrade
-from rest_framework.decorators import api_view
-
-
-from django.shortcuts import get_object_or_404
-
 from .models import BandwidthUpgrade, ProvisioningTask
 from .tasks import execute_bandwidth_upgrade, fetch_device_interfaces
 from devices.models import Router
 
 
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from rest_framework import status
-from django.shortcuts import get_object_or_404
-from .models import BandwidthUpgrade
-from .tasks import execute_bandwidth_upgrade
-from devices.models import Router
-
+# ─────────────────────────────────────────────────────────────
+#  BANDWIDTH UPGRADE — CREATE
+# ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def create_bandwidth_upgrade(request):
     """
-    API endpoint to initiate a bandwidth upgrade.
+    Initiate a bandwidth upgrade.
+    POST /api/provisioning/bandwidth-upgrade/
     """
     data = request.data
-    device_id = data.get('device_id')
-    interface = data.get('interface')
+    device_id    = data.get('device_id')
+    interface    = data.get('interface')
     customer_name = data.get('customer_name')
     new_bandwidth = data.get('new_bandwidth_mbps')
 
-    # Validation
     if not all([device_id, interface, customer_name, new_bandwidth]):
-        return Response({'error': 'Missing required fields'}, status=400)
+        return Response({'error': 'Missing required fields: device_id, interface, customer_name, new_bandwidth_mbps'}, status=400)
 
-# Django's default primary key is 'id'
     device = get_object_or_404(Router, id=device_id)
 
-    # Create record
     upgrade = BandwidthUpgrade.objects.create(
         device=device,
         interface=interface,
@@ -52,116 +42,128 @@ def create_bandwidth_upgrade(request):
         status='pending'
     )
 
-    # Trigger Celery
-    task = execute_bandwidth_upgrade.delay(upgrade.upgrade_id)
-    
-    # Link task ID for tracking
-    upgrade.celery_task_id = task.id
-    upgrade.save()
+    # ─── KEY FIX ─────────────────────────────────────────────
+    # Fire the Celery task ONLY after the DB transaction commits.
+    # Without this, Celery picks up the task before the upgrade
+    # record exists in the database, causing a silent DoesNotExist
+    # error that leaves the status stuck at 'pending' forever.
+    # ─────────────────────────────────────────────────────────
+    def fire_task():
+        task = execute_bandwidth_upgrade.delay(upgrade.upgrade_id)
+        # Store the celery task id after we have it
+        BandwidthUpgrade.objects.filter(upgrade_id=upgrade.upgrade_id).update(
+            celery_task_id=task.id
+        )
+
+    transaction.on_commit(fire_task)
 
     return Response({
-        'status': 'initiated',
+        'status':     'initiated',
         'upgrade_id': upgrade.upgrade_id,
-        'task_id': task.id
+        'message':    'Upgrade queued. Celery task will start shortly.'
     }, status=status.HTTP_201_CREATED)
+
+
+# ─────────────────────────────────────────────────────────────
+#  BANDWIDTH UPGRADE — LIST
+# ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def list_bandwidth_upgrades(request):
     """
-    List all bandwidth upgrades
-    
-    GET /api/provisioning/bandwidth-upgrades/
-    Query params:
-    - status: filter by status (pending, in_progress, completed, failed)
-    - device_id: filter by device
+    List all bandwidth upgrades with optional filters.
+    GET /api/provisioning/bandwidth-upgrades/?status=completed&device_id=1
     """
-    upgrades = BandwidthUpgrade.objects.all()
-    
-    # Filter by status
+    upgrades = BandwidthUpgrade.objects.all().order_by('-created_at')
+
     status_filter = request.query_params.get('status')
     if status_filter:
         upgrades = upgrades.filter(status=status_filter)
-    
-    # Filter by device
+
     device_id = request.query_params.get('device_id')
     if device_id:
         upgrades = upgrades.filter(device_id=device_id)
-    
-    # Serialize
+
     data = []
     for upgrade in upgrades:
         data.append({
-            'upgrade_id': upgrade.upgrade_id,
-          # Inside the loop for data.append(...)
-            'device_name': upgrade.device.name,            # Based on your choices list
-            'device_ip': upgrade.device.loopback_ip,       # Changed from .ip_address
-            'interface': upgrade.interface,
-            'vlan': upgrade.vlan,
-            'customer_name': upgrade.customer_name,
+            'upgrade_id':         upgrade.upgrade_id,
+            'device_name':        upgrade.device.name,
+            'device_ip':          upgrade.device.loopback_ip,
+            'vendor':             upgrade.device.vendor,
+            'interface':          upgrade.interface,
+            'vlan':               upgrade.vlan,
+            'customer_name':      upgrade.customer_name,
             'old_bandwidth_mbps': upgrade.old_bandwidth_mbps,
             'new_bandwidth_mbps': upgrade.new_bandwidth_mbps,
-            'status': upgrade.status,
-            'is_upgrade': upgrade.is_upgrade,
-            'created_at': upgrade.created_at.isoformat(),
-            'created_by': upgrade.created_by.username if upgrade.created_by else None,
+            'status':             upgrade.status,
+            'is_upgrade':         upgrade.is_upgrade,
+            'celery_task_id':     upgrade.celery_task_id,
             'generated_commands': upgrade.generated_commands,
-            'execution_output': upgrade.execution_output,
+            'execution_output':   upgrade.execution_output,
+            'created_at':         upgrade.created_at.isoformat(),
+            'started_at':         upgrade.started_at.isoformat() if upgrade.started_at else None,
+            'completed_at':       upgrade.completed_at.isoformat() if upgrade.completed_at else None,
+            'created_by':         upgrade.created_by.username if upgrade.created_by else None,
         })
-    
+
     return Response(data)
 
 
+# ─────────────────────────────────────────────────────────────
+#  BANDWIDTH UPGRADE — DETAIL
+# ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def get_bandwidth_upgrade_detail(request, upgrade_id):
     """
-    Get single upgrade detail
-    
+    Get single upgrade detail.
     GET /api/provisioning/bandwidth-upgrades/{upgrade_id}/
     """
     upgrade = get_object_or_404(BandwidthUpgrade, upgrade_id=upgrade_id)
-    
+
     return Response({
-        'upgrade_id': upgrade.upgrade_id,
-        'device_name': upgrade.device.name,
-        'device_ip': upgrade.device.loopback_ip,
-        'vendor': upgrade.device.vendor,
-        'interface': upgrade.interface,
-        'vlan': upgrade.vlan,
-        'customer_name': upgrade.customer_name,
+        'upgrade_id':         upgrade.upgrade_id,
+        'device_name':        upgrade.device.name,
+        'device_ip':          upgrade.device.loopback_ip,
+        'vendor':             upgrade.device.vendor,
+        'interface':          upgrade.interface,
+        'vlan':               upgrade.vlan,
+        'customer_name':      upgrade.customer_name,
         'old_bandwidth_mbps': upgrade.old_bandwidth_mbps,
         'new_bandwidth_mbps': upgrade.new_bandwidth_mbps,
-        'status': upgrade.status,
-        'is_upgrade': upgrade.is_upgrade,
-        'celery_task_id': upgrade.celery_task_id,
+        'status':             upgrade.status,
+        'is_upgrade':         upgrade.is_upgrade,
+        'celery_task_id':     upgrade.celery_task_id,
         'generated_commands': upgrade.generated_commands,
-        'execution_output': upgrade.execution_output,
-        'created_at': upgrade.created_at.isoformat(),
-        'started_at': upgrade.started_at.isoformat() if upgrade.started_at else None,
-        'completed_at': upgrade.completed_at.isoformat() if upgrade.completed_at else None,
-        'created_by': upgrade.created_by.username if upgrade.created_by else None,
+        'execution_output':   upgrade.execution_output,
+        'created_at':         upgrade.created_at.isoformat(),
+        'started_at':         upgrade.started_at.isoformat() if upgrade.started_at else None,
+        'completed_at':       upgrade.completed_at.isoformat() if upgrade.completed_at else None,
+        'created_by':         upgrade.created_by.username if upgrade.created_by else None,
     })
 
 
+# ─────────────────────────────────────────────────────────────
+#  FETCH INTERFACES
+# ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def fetch_interfaces(request):
     """
-    Fetch interfaces from device via SSH
-    
+    Fetch interfaces from device via SSH (sync Celery task with timeout).
     POST /api/provisioning/fetch-interfaces/
     Body: { "device_id": 1 }
     """
     device_id = request.data.get('device_id')
-    
+
     if not device_id:
         return Response(
             {'error': 'device_id is required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
-    # Trigger async task and wait for result
+
     task = fetch_device_interfaces.delay(device_id)
-    
+
     try:
-        result = task.get(timeout=30)  # Wait max 30 seconds
+        result = task.get(timeout=30)   # Wait max 30 seconds
         return Response(result)
     except Exception as e:
         return Response(
@@ -170,42 +172,51 @@ def fetch_interfaces(request):
         )
 
 
+# ─────────────────────────────────────────────────────────────
+#  RETRY UPGRADE
+# ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def retry_upgrade(request, upgrade_id):
     """
-    Retry a failed upgrade
-    
+    Retry a failed upgrade.
     POST /api/provisioning/bandwidth-upgrades/{upgrade_id}/retry/
     """
     upgrade = get_object_or_404(BandwidthUpgrade, upgrade_id=upgrade_id)
-    
+
     if upgrade.status not in ['failed']:
         return Response(
             {'error': 'Only failed upgrades can be retried'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
-    # Reset status
-    upgrade.status = 'pending'
+
+    # Reset to pending
+    upgrade.status           = 'pending'
     upgrade.execution_output = None
-    upgrade.started_at = None
-    upgrade.completed_at = None
+    upgrade.started_at       = None
+    upgrade.completed_at     = None
     upgrade.save()
-    
-    # Trigger new task
-    task = execute_bandwidth_upgrade.delay(upgrade.upgrade_id)
-    upgrade.celery_task_id = task.id
-    upgrade.save()
-    
+
+    # Same fix: fire after commit
+    def fire_retry():
+        task = execute_bandwidth_upgrade.delay(upgrade.upgrade_id)
+        BandwidthUpgrade.objects.filter(upgrade_id=upgrade.upgrade_id).update(
+            celery_task_id=task.id
+        )
+
+    transaction.on_commit(fire_retry)
+
     return Response({
         'message': 'Upgrade retry initiated',
-        'celery_task_id': task.id
     })
 
+
+# ─────────────────────────────────────────────────────────────
+#  PROVISIONING TASKS (existing)
+# ─────────────────────────────────────────────────────────────
 class ProvisioningTaskViewSet(viewsets.ReadOnlyModelViewSet):
     """List and retrieve provisioning tasks."""
-    queryset = ProvisioningTask.objects.all()
-    serializer_class = ProvisioningTaskSerializer
+    queryset            = ProvisioningTask.objects.all()
+    serializer_class    = ProvisioningTaskSerializer
 
 
 class StartProvisioningView(APIView):
@@ -218,10 +229,8 @@ class StartProvisioningView(APIView):
         if serializer.is_valid():
             task = serializer.save()
 
-            # Fire Celery task
             celery_task = run_provisioning.delay(task.id)
 
-            # Save celery task ID
             task.celery_task_id = celery_task.id
             task.save()
 
@@ -259,5 +268,4 @@ class ProvisioningStatusView(APIView):
                 {'error': 'Task not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-
 
