@@ -50,6 +50,7 @@ INSTALLED_APPS = [
 'provisioning',
 'monitoring',
 'reporting',
+'inventory',
 ]
 
 MIDDLEWARE = [

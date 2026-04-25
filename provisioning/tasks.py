@@ -1,13 +1,14 @@
 import redis
 import logging
-import time  # Added for simulation delay
 from celery import shared_task
 from django.utils import timezone
 from netmiko import ConnectHandler
+from napalm import get_network_driver
 from .models import BandwidthUpgrade
 
 logger = logging.getLogger(__name__)
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
 
 @shared_task(bind=True)
 def execute_bandwidth_upgrade(self, upgrade_id):
@@ -20,7 +21,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         return "Upgrade record not found."
 
     device = upgrade.device
-    # Use loopback_ip instead of ip_address
     lock_key = f'device_lock_{device.loopback_ip}'
 
     # --- 1. Acquire Redis Lock ---
@@ -38,38 +38,31 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         upgrade.started_at = timezone.now()
         upgrade.save()
 
-        # --- 3. Construct Commands ---
-        commands = [
-            f"interface {upgrade.interface}",
-            f"bandwidth {upgrade.new_bandwidth_mbps * 1000}" 
-        ]
-        upgrade.generated_commands = "\n".join(commands)
-        upgrade.save()
-
-        # --- 4. Netmiko Execution (COMMENTED OUT FOR TESTING) ---
-        """
+        # --- 3. Real Netmiko Execution (NE40 VRP8 compatible) ---
         device_params = {
-            'device_type': 'huawei', 
+            'device_type': 'huawei',
             'host': device.loopback_ip,
-            'username': 'admin',  
-            'password': 'password',
+            'username': device.ssh_username,
+            'password': device.ssh_password,
+            'port': 22,
         }
 
         with ConnectHandler(**device_params) as conn:
-            output = conn.send_config_set(commands)
-            conn.save_config()
-        """
+            conn.send_command('system-view', expect_string=r'\[')
+            conn.send_command(f'interface {upgrade.interface}', expect_string=r'\[')
+            conn.send_command(f'bandwidth {upgrade.new_bandwidth_mbps * 1000}', expect_string=r'\[')
+            output = conn.send_command('commit', expect_string=r'\[')  # commit before return
+            conn.send_command('return', expect_string=r'\>')
 
-        # --- FAKE TEST BLOCK (SIMULATION) ---
-        time.sleep(5)  # Simulate 5 seconds of network configuration work
-        output = (
-            f"Connecting to {device.loopback_ip}...\n"
-            f"Applying commands:\n{upgrade.generated_commands}\n"
-            f"Configuration committed successfully."
-        )
-        # ------------------------------------
+        upgrade.generated_commands = "\n".join([
+            f"interface {upgrade.interface}",
+            f"bandwidth {upgrade.new_bandwidth_mbps * 1000}",
+            "commit",
+            "return"
+        ])
+        upgrade.save()
 
-        # --- 5. Mark as Completed ---
+        # --- 4. Mark as Completed ---
         upgrade.status = 'completed'
         upgrade.execution_output = output
         upgrade.completed_at = timezone.now()
@@ -87,7 +80,8 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         redis_client.delete(lock_key)
 
     return upgrade.status
-    
+
+
 @shared_task
 def fetch_device_interfaces(device_id):
     """
@@ -95,27 +89,105 @@ def fetch_device_interfaces(device_id):
     """
     from devices.models import Router
     try:
-        device_obj = Router.objects.get(id=device_id) # Using 'id' based on previous FieldError
-        
-        # --- Netmiko Execution (COMMENTED OUT FOR TESTING) ---
-        """
+        device_obj = Router.objects.get(id=device_id)
+
         device_params = {
-            'device_type': 'huawei', 
+            'device_type': 'huawei',
             'host': device_obj.loopback_ip,
-            'username': 'admin',
-            'password': 'password',
+            'username': device_obj.ssh_username,
+            'password': device_obj.ssh_password,
+            'port': 22,
         }
 
         with ConnectHandler(**device_params) as conn:
             output = conn.send_command("display interface description")
-        """
 
-        # --- FAKE TEST BLOCK (SIMULATION) ---
-        time.sleep(2)
-        output = "Interface    Status    Description\nGE0/0/1      Up        To_Core\nGE0/0/2      Down      User_Access"
-        # ------------------------------------
-            
         return {'status': 'success', 'data': output}
-    
+
     except Exception as e:
         return {'status': 'error', 'message': str(e)}
+
+
+@shared_task(bind=True)
+def execute_port_reservation(self, port_id, router_id, description):
+    """
+    Executes a port reservation (no shut + description) with Redis locking.
+    """
+    from devices.models import Router, Port
+
+    try:
+        port = Port.objects.get(id=port_id)
+        router = Router.objects.get(id=router_id)
+    except (Port.DoesNotExist, Router.DoesNotExist):
+        return "Port or Router record not found."
+
+    lock_key = f'device_lock_{router.loopback_ip}'
+
+    # --- 1. Acquire Redis Lock ---
+    lock_acquired = redis_client.set(lock_key, f"port_res_{port_id}", nx=True, ex=300)
+
+    if not lock_acquired:
+        port.admin_status = 'inactive'
+        port.save()
+        logger.warning(f"Device {router.loopback_ip} is busy. Reservation for {port.port_full_name} queued/retrying.")
+        raise self.retry(countdown=60, max_retries=3)
+
+    try:
+        # --- 3. Real Hardware Execution ---
+        if router.vendor.lower() == 'huawei':
+            device_params = {
+                'device_type': 'huawei',
+                'host': router.loopback_ip,
+                'username': router.ssh_username,
+                'password': router.ssh_password,
+                'port': 22,
+            }
+            with ConnectHandler(**device_params) as net_connect:
+                net_connect.send_command('system-view', expect_string=r'\[')
+                net_connect.send_command(f'interface {port.port_full_name}', expect_string=r'\[')
+                net_connect.send_command(f'description {description}', expect_string=r'\[')
+                net_connect.send_command('undo shutdown', expect_string=r'\[')
+                output = net_connect.send_command('commit', expect_string=r'\[')  # commit before return
+                net_connect.send_command('return', expect_string=r'\>')
+                logger.info(f"Huawei Output: {output}")
+
+        elif router.vendor.lower() == 'juniper':
+            driver = get_network_driver('junos')
+            device = driver(
+                hostname=router.loopback_ip,
+                username=router.ssh_username,
+                password=router.ssh_password
+            )
+            device.open()
+
+            config_string = f'''
+            delete interfaces {port.port_full_name} disable
+            set interfaces {port.port_full_name} description "{description}"
+            '''
+            device.load_merge_candidate(config=config_string)
+            device.commit_config()
+            device.close()
+            output = f"Juniper Config Committed for {port.port_full_name}"
+            logger.info(output)
+
+        else:
+            raise ValueError(f"Unsupported vendor: {router.vendor}")
+
+        # --- 4. Database Reconciliation (SUCCESS) ---
+        port.admin_status = 'active'
+        port.oper_status = 'up'
+        port.port_description = description
+        port.save()
+
+        return f"Successfully provisioned {port.port_full_name}"
+
+    except Exception as e:
+        # --- 5. Database Reconciliation (FAILURE) ---
+        logger.error(f"Failed to provision port {port.port_full_name}: {str(e)}")
+        port.admin_status = 'inactive'
+        port.save()
+        raise e
+
+    finally:
+        # --- 6. Always Release Lock ---
+        redis_client.delete(lock_key)

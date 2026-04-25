@@ -7,8 +7,12 @@ from django.db import transaction
 
 from .serializers import ProvisioningTaskSerializer
 from .models import BandwidthUpgrade, ProvisioningTask
-from .tasks import execute_bandwidth_upgrade, fetch_device_interfaces
-from devices.models import Router
+
+# --- ADDED: execute_port_reservation task import ---
+from .tasks import execute_bandwidth_upgrade, fetch_device_interfaces, execute_port_reservation
+
+# --- ADDED: Port model import ---
+from devices.models import Router, Port
 
 
 # ─────────────────────────────────────────────────────────────
@@ -148,30 +152,93 @@ def get_bandwidth_upgrade_detail(request, upgrade_id):
 @api_view(['POST'])
 def fetch_interfaces(request):
     """
-    Fetch interfaces from device via SSH (sync Celery task with timeout).
-    POST /api/provisioning/fetch-interfaces/
-    Body: { "device_id": 1 }
+    Fetch interfaces from the database by matching the device's ne_name.
     """
     device_id = request.data.get('device_id')
 
     if not device_id:
+        return Response({'error': 'device_id is required'}, status=400)
+
+    # 1. Find the device (assuming Router for now, we will unify this later)
+    device = get_object_or_404(Router, id=device_id)
+
+    # 2. Find all ports where ne_name matches the device name
+    db_ports = Port.objects.filter(ne_name=device.name)
+
+    # 3. Translate Django Database keys to Angular Frontend keys
+    formatted_interfaces = []
+    for port in db_ports:
+        is_up = port.oper_status.lower() == 'up'
+        
+        formatted_interfaces.append({
+            'interface': port.port_full_name,        # Matches Angular 'interface'
+            'description': port.port_description,    # Matches Angular 'description'
+            'client_name': port.port_alias,          # Matches Angular 'client_name'
+            'status': port.oper_status.upper(),      # Matches Angular 'status'
+            'is_available': is_up                    # Matches Angular 'is_available'
+        })
+
+    return Response({
+        'status': 'success',
+        'interfaces': formatted_interfaces
+    })
+
+
+# ─────────────────────────────────────────────────────────────
+#  PORT RESERVATION — CREATE
+# ─────────────────────────────────────────────────────────────
+@api_view(['POST'])
+def reserve_port(request):
+    """
+    Reserves a port and triggers the background configuration task.
+    POST /api/provisioning/reserve-port/
+    """
+    # --- GET DATA FROM FRONTEND ---
+    router_id = request.data.get('router_id')
+    port_id = request.data.get('port_id')  # <--- THIS WAS THE MISSING VARIABLE
+    description = request.data.get('description', 'Reserved via Automation')
+
+    # --- VALIDATE ---
+    if not router_id or not port_id:
         return Response(
-            {'error': 'device_id is required'},
+            {'error': 'router_id and port_id are required'}, 
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    task = fetch_device_interfaces.delay(device_id)
+    router = get_object_or_404(Router, id=router_id)
 
-    try:
-        result = task.get(timeout=30)   # Wait max 30 seconds
-        return Response(result)
-    except Exception as e:
-        return Response(
-            {'status': 'error', 'message': str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    # 1. Start a database transaction to prevent Race Conditions
+    with transaction.atomic():
+        # select_for_update() locks the rows until the transaction finishes.
+        available_port = Port.objects.select_for_update().filter(
+            id=port_id,  # <-- Now this knows exactly what to look for!
+            ne_name=router.name,
+            admin_status='inactive',
+            oper_status='down'
+        ).first()
 
+        if not available_port:
+            return Response({
+                'status': 'error', 
+                'message': 'This specific port is not available (it must be down and inactive).'
+            }, status=status.HTTP_404_NOT_FOUND)
 
+        # 2. Lock the port temporarily so no one else can reserve it
+        available_port.admin_status = 'pending_reservation'
+        available_port.save()
+
+    # 3. Fire the background Celery Task
+    def fire_ssh_task():
+        execute_port_reservation.delay(available_port.id, router.id, description)
+    
+    transaction.on_commit(fire_ssh_task)
+
+    # 4. Immediately reply to the frontend
+    return Response({
+        'status': 'processing',
+        'port_name': available_port.port_full_name,
+        'message': f'Port {available_port.port_full_name} locked. Configuring router now...'
+    }, status=status.HTTP_202_ACCEPTED)
 # ─────────────────────────────────────────────────────────────
 #  RETRY UPGRADE
 # ─────────────────────────────────────────────────────────────
@@ -229,21 +296,62 @@ class StartProvisioningView(APIView):
         if serializer.is_valid():
             task = serializer.save()
 
-            celery_task = run_provisioning.delay(task.id)
+            # Look up the router by device_name
+            try:
+                router = Router.objects.get(name=task.device_name)
+            except Router.DoesNotExist:
+                task.status = 'failed'
+                task.save()
+                return Response(
+                    {'error': f'Device "{task.device_name}" not found in database.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
 
-            task.celery_task_id = celery_task.id
-            task.save()
+            # Route to the correct Celery task based on task_type
+            if task.task_type in ['configure_vlan', 'firmware_upgrade', 'push_acl']:
+                # Find or create a port entry for this device
+                port = Port.objects.filter(
+                    ne_name=router.name
+                ).first()
+
+                if not port:
+                    # Create a temporary port for testing if none exists
+                    port = Port.objects.create(
+                        ne_name=router.name,
+                        port_full_name=task.parameters.get('interface', 'Ethernet1/0/1'),
+                        port_name=task.parameters.get('interface', 'Ethernet1/0/1'),
+                        admin_status='inactive',
+                        oper_status='down'
+                    )
+
+                def fire_task():
+                    celery_task = execute_port_reservation.delay(
+                        port.id,
+                        router.id,
+                        f'{task.task_type} via NOC Dashboard'
+                    )
+                    ProvisioningTask.objects.filter(id=task.id).update(
+                        celery_task_id=celery_task.id,
+                        status='queued'
+                    )
+
+                transaction.on_commit(fire_task)
+
+            else:
+                task.status = 'failed'
+                task.save()
+                return Response(
+                    {'error': f'Unknown task_type: {task.task_type}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             return Response({
-                'task_id':        task.id,
-                'celery_task_id': celery_task.id,
-                'status':         task.status,
-                'message':        f'Provisioning started for {task.device_name}'
+                'task_id':   task.id,
+                'status':    'queued',
+                'message':   f'Provisioning started for {task.device_name}'
             }, status=status.HTTP_202_ACCEPTED)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
 class ProvisioningStatusView(APIView):
     """
     GET /api/provisioning/status/<task_id>/
@@ -268,4 +376,12 @@ class ProvisioningStatusView(APIView):
                 {'error': 'Task not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-
+@api_view(['GET'])
+def get_port_id(request):
+    router_id = request.query_params.get('router_id')
+    port_name = request.query_params.get('port_name')
+    
+    router = get_object_or_404(Router, id=router_id)
+    port = get_object_or_404(Port, ne_name=router.name, port_full_name=port_name)
+    
+    return Response({'port_id': port.id})

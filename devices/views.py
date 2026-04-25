@@ -1,15 +1,35 @@
 from rest_framework.response import Response
 from rest_framework import status
-from django.shortcuts import render
+from django.shortcuts import render, get_object_or_404
 from rest_framework import viewsets
-from .models import Router, Switch , Port , Card, SFP
-from .serializers import PortSerializer, CardSerializer, SFPSerializer, RouterSerializer , SwitchSerializer
+from rest_framework.decorators import api_view
+from .models import Router, Switch, Port, Card, SFP
+from .serializers import PortSerializer, CardSerializer, SFPSerializer, RouterSerializer, SwitchSerializer
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from rest_framework.views import APIView
 from django.db.models import Count
 from backhaul.models import BackhaulLink
+from .serializers import UnifiedDeviceDetailSerializer
+from itertools import chain
 
+class UnifiedDeviceListView(APIView):
+    """
+    GET /api/hardware/all-devices/
+    Returns both Routers and Switches with their nested Cards, Ports, and SFPs.
+    """
+    def get(self, request):
+        # Fetch all Routers and Switches
+        routers = Router.objects.all()
+        switches = Switch.objects.all()
+
+        # Combine them into a single list
+        combined_devices = list(chain(routers, switches))
+
+        # Serialize the combined list
+        serializer = UnifiedDeviceDetailSerializer(combined_devices, many=True)
+        
+        return Response(serializer.data)
 class RouterViewSet(viewsets.ModelViewSet):
     queryset = Router.objects.all()
     serializer_class = RouterSerializer
@@ -202,3 +222,12 @@ class DashboardStatsView(APIView):
                 }
             }
         }, status=status.HTTP_200_OK)
+@api_view(['GET'])
+def get_port_id(request):
+    router_id = request.query_params.get('router_id')
+    port_name = request.query_params.get('port_name')
+    
+    router = get_object_or_404(Router, id=router_id)
+    port = get_object_or_404(Port, ne_name=router.name, port_full_name=port_name)
+    
+    return Response({'port_id': port.id})

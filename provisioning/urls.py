@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import StartProvisioningView, ProvisioningStatusView, ProvisioningTaskViewSet
+from .views import StartProvisioningView, ProvisioningStatusView, ProvisioningTaskViewSet , reserve_port
 from . import views
 
 router = DefaultRouter()
@@ -15,5 +15,6 @@ urlpatterns = [
     path('bandwidth-upgrades/<int:upgrade_id>/', views.get_bandwidth_upgrade_detail, name='get-bandwidth-upgrade'),
     path('bandwidth-upgrades/<int:upgrade_id>/retry/', views.retry_upgrade, name='retry-upgrade'),
     path('fetch-interfaces/', views.fetch_interfaces, name='fetch-interfaces'),
+    path('reserve-port/', reserve_port, name='reserve-port'),
 ]
 
