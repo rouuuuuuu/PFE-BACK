@@ -9,7 +9,7 @@ from .serializers import ProvisioningTaskSerializer
 from .models import BandwidthUpgrade, ProvisioningTask
 
 # --- ADDED: execute_port_reservation task import ---
-from .tasks import execute_bandwidth_upgrade, fetch_device_interfaces, execute_port_reservation
+from .tasks import execute_bandwidth_upgrade, fetch_device_interfaces, execute_port_reservation, execute_internet_provisioning 
 
 # --- ADDED: Port model import ---
 from devices.models import Router, Port
@@ -307,15 +307,51 @@ class StartProvisioningView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
 
-            # Route to the correct Celery task based on task_type
-            if task.task_type in ['configure_vlan', 'firmware_upgrade', 'push_acl']:
-                # Find or create a port entry for this device
-                port = Port.objects.filter(
-                    ne_name=router.name
-                ).first()
+            # ─── INTERNET SERVICE ROUTING ───
+            if task.task_type == 'internet_service':
+                port_id = task.parameters.get('port_id')
+                
+                if not port_id:
+                    return Response({'error': 'port_id is required in parameters for internet service'}, status=400)
+
+                # Lock the port safely
+                with transaction.atomic():
+                    port = Port.objects.select_for_update().filter(
+                        id=port_id, 
+                        ne_name=router.name,
+                        admin_status='inactive'
+                    ).first()
+
+                    if not port:
+                        task.status = 'failed'
+                        task.result = 'Port is already in use or does not exist.'
+                        task.save()
+                        return Response({'error': 'Port unavailable.'}, status=409)
+
+                    # Lock it temporarily
+                    port.admin_status = 'pending_provisioning'
+                    port.save()
+
+                def fire_internet_task():
+                    celery_task = execute_internet_provisioning.delay(task.id, router.id, port.id)
+                    ProvisioningTask.objects.filter(id=task.id).update(
+                        celery_task_id=celery_task.id,
+                        status='queued'
+                    )
+
+                transaction.on_commit(fire_internet_task)
+                
+                return Response({
+                    'task_id': task.id,
+                    'status': 'queued',
+                    'message': f'Internet provisioning queued for {task.device_name}'
+                }, status=status.HTTP_202_ACCEPTED)
+
+            # ─── EXISTING TASK ROUTING ───
+            elif task.task_type in ['configure_vlan', 'firmware_upgrade', 'push_acl']:
+                port = Port.objects.filter(ne_name=router.name).first()
 
                 if not port:
-                    # Create a temporary port for testing if none exists
                     port = Port.objects.create(
                         ne_name=router.name,
                         port_full_name=task.parameters.get('interface', 'Ethernet1/0/1'),
@@ -376,12 +412,4 @@ class ProvisioningStatusView(APIView):
                 {'error': 'Task not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
-@api_view(['GET'])
-def get_port_id(request):
-    router_id = request.query_params.get('router_id')
-    port_name = request.query_params.get('port_name')
-    
-    router = get_object_or_404(Router, id=router_id)
-    port = get_object_or_404(Port, ne_name=router.name, port_full_name=port_name)
-    
-    return Response({'port_id': port.id})
+

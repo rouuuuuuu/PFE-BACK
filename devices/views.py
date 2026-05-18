@@ -3,7 +3,7 @@ from rest_framework import status
 from django.shortcuts import render, get_object_or_404
 from rest_framework import viewsets
 from rest_framework.decorators import api_view
-from .models import Router, Switch, Port, Card, SFP
+from .models import Router, Switch, Port, Card, SFP, SubCard
 from .serializers import PortSerializer, CardSerializer, SFPSerializer, RouterSerializer, SwitchSerializer
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
@@ -13,29 +13,23 @@ from backhaul.models import BackhaulLink
 from .serializers import UnifiedDeviceDetailSerializer
 from itertools import chain
 
+
 class UnifiedDeviceListView(APIView):
-    """
-    GET /api/hardware/all-devices/
-    Returns both Routers and Switches with their nested Cards, Ports, and SFPs.
-    """
     def get(self, request):
-        # Fetch all Routers and Switches
         routers = Router.objects.all()
         switches = Switch.objects.all()
-
-        # Combine them into a single list
         combined_devices = list(chain(routers, switches))
-
-        # Serialize the combined list
         serializer = UnifiedDeviceDetailSerializer(combined_devices, many=True)
-        
         return Response(serializer.data)
+
+
 class RouterViewSet(viewsets.ModelViewSet):
     queryset = Router.objects.all()
     serializer_class = RouterSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['vendor']  # Filter by vendor (Huawei/Cisco)
+    filterset_fields = ['vendor']
     search_fields = ['name', 'loopback_ip']
+
 
 class SwitchViewSet(viewsets.ModelViewSet):
     queryset = Switch.objects.all()
@@ -44,121 +38,135 @@ class SwitchViewSet(viewsets.ModelViewSet):
     filterset_fields = ['model']
     search_fields = ['name', 'loopback_ip']
 
+
 class PortViewSet(viewsets.ModelViewSet):
     queryset = Port.objects.all()
     serializer_class = PortSerializer
-    filterset_fields = ['status']            # Filter ports by status (Up/Down)
+    filterset_fields = ['oper_status']
+
 
 class CardViewSet(viewsets.ModelViewSet):
     queryset = Card.objects.all()
     serializer_class = CardSerializer
 
+
 class SFPViewSet(viewsets.ModelViewSet):
     queryset = SFP.objects.all()
     serializer_class = SFPSerializer
 
+
 class HardwareVerifyView(APIView):
-    """
-    Custom endpoint to verify the hardware status of a specific device by its IP.
-    URL: /api/hardware/verify/<device_ip>/
-    """
     def get(self, request, device_ip):
-        # 1. Find the Router by loopback_ip
         try:
-            device = Router.objects.get(loopback_ip=device_ip) 
+            device = Router.objects.get(loopback_ip=device_ip)
         except Router.DoesNotExist:
             return Response(
-                {"error": f"Router with IP {device_ip} not found."}, 
+                {"error": f"Router with IP {device_ip} not found."},
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # 2. Query related hardware using 'ne_name' as the linking key
-        ports = Port.objects.filter(ne_name=device.name)
-        cards = Card.objects.filter(ne_name=device.name)
-        sfps = SFP.objects.filter(ne_name=device.name)
+        ports    = Port.objects.filter(ne_name=device.name)
+        cards    = Card.objects.filter(ne_name=device.name)
+        sfps     = SFP.objects.filter(ne_name=device.name)
+        subcards = SubCard.objects.filter(ne_name=device.name)
 
-        # 3. Calculate status logic
-        ports_ok = not ports.filter(oper_status__iexact='down').exists()
-        cards_ok = not cards.filter(board_status__iexact='abnormal').exists()
-        sfps_ok = not (sfps.filter(rx_status__iexact='abnormal').exists() or 
-                       sfps.filter(tx_status__iexact='abnormal').exists())
+        ports_ok    = not ports.filter(oper_status__iexact='down').exists()
+        cards_ok    = not cards.filter(board_status__iexact='abnormal').exists()
+        sfps_ok     = not (sfps.filter(rx_status__iexact='abnormal').exists() or
+                           sfps.filter(tx_status__iexact='abnormal').exists())
+        subcards_ok = not subcards.filter(subboard_status__iexact='abnormal').exists()
 
-        overall_ok = all([ports_ok, cards_ok, sfps_ok])
+        overall_ok = all([ports_ok, cards_ok, sfps_ok, subcards_ok])
 
-     # 4. Extract Detailed Lists for Angular
+        # ── Port details ──────────────────────────────────────
         port_details = []
         for p in ports:
             port_details.append({
-                "name": getattr(p, 'port_name', getattr(p, 'name', 'Unknown')),
-                "status": getattr(p, 'oper_status', 'unknown').lower(),
-                "description": getattr(p, 'port_description', getattr(p, 'description', 'N/A')),
-                # --- NEW FIELDS FOR ANGULAR ---
-                "rate": getattr(p, 'port_rate_kbits', 'N/A'),
-                "admin_status": getattr(p, 'administrative_status', 'N/A'),
-                "port_type": getattr(p, 'port_type', 'N/A')
+                "name":         p.port_full_name or p.port_name or 'Unknown',
+                "status":       p.oper_status.lower(),
+                "description":  p.port_description or '',
+                "rate":         p.port_rate or 'N/A',
+                "admin_status": p.admin_status or 'N/A',
+                "port_type":    p.port_type or 'N/A',
+                "port_ip":      p.port_ip_address or '',
             })
 
+        # ── Card details ──────────────────────────────────────
         card_details = []
         for c in cards:
             card_details.append({
-                "name": getattr(c, 'board_name', getattr(c, 'name', 'Unknown')),
-                "status": getattr(c, 'board_status', 'unknown').lower(),
-                "description": f"Type: {getattr(c, 'board_type', 'N/A')}",
-                # --- NEW FIELDS FOR ANGULAR ---
-                "board_type": getattr(c, 'board_type', 'N/A'),
-                "hardware_version": getattr(c, 'hardware_version', 'N/A'),
-                "software_version": getattr(c, 'software_version', 'N/A'),
-                "serial_number": getattr(c, 'sn_bar_code', getattr(c, 'serial_number', 'N/A'))
+                "name":             c.board_full_name or c.board_name or 'Unknown',
+                "status":           c.board_status.lower(),
+                "description":      c.description or '',
+                "board_type":       c.board_type or 'N/A',
+                "slot_id":          c.slot_id or 'N/A',
+                "hardware_version": c.hardware_version or 'N/A',
+                "software_version": c.software_version or 'N/A',
+                "serial_number":    c.serial_number or 'N/A',
+                "manufactured_on":  c.manufactured_on or 'N/A',
             })
 
+        # ── SFP details ───────────────────────────────────────
         sfp_details = []
         for s in sfps:
-            # SFP status depends on both RX and TX
-            rx = getattr(s, 'rx_status', 'unknown').lower()
-            tx = getattr(s, 'tx_status', 'unknown').lower()
-            status_val = 'abnormal' if rx == 'abnormal' or tx == 'abnormal' else 'normal'
-            
+            rx = s.rx_status.lower()
+            tx = s.tx_status.lower()
             sfp_details.append({
-                "name": getattr(s, 'port_name', getattr(s, 'name', 'Unknown')),
-                "status": status_val,
-                "description": f"Speed: {getattr(s, 'speed', 'N/A')} | Vendor: {getattr(s, 'manufacturer', 'N/A')}",
-                # --- NEW FIELDS FOR ANGULAR ---
-                "speed": getattr(s, 'speed_mbs', getattr(s, 'speed', 'N/A')),
-                "vendor": getattr(s, 'manufacturer', getattr(s, 'vendor', 'N/A')),
-                "rx_power": getattr(s, 'receive_optical_power_dbm', getattr(s, 'rx_power', 'N/A')),
-                "tx_power": getattr(s, 'transmit_optical_power_dbm', getattr(s, 'tx_power', 'N/A')),
-                "optical_type": getattr(s, 'fiber_type', getattr(s, 'optical_type', 'N/A'))
+                "name":         s.port_name or 'Unknown',
+                "status":       'abnormal' if rx == 'abnormal' or tx == 'abnormal' else 'normal',
+                "description":  s.port_description or '',
+                "speed":        s.speed or 'N/A',
+                "manufacturer": s.manufacturer or 'N/A',
+                "rx_power":     s.rx_power or 'N/A',
+                "tx_power":     s.tx_power or 'N/A',
+                "rx_status":    rx,
+                "tx_status":    tx,
+                "optical_type": s.optical_type or 'N/A',
+                "fiber_type":   s.fiber_type or 'N/A',
+                "wavelength":   s.wavelength or 'N/A',
             })
 
-        # 5. Construct the final response
+        # ── SubCard details ───────────────────────────────────
+        subcard_details = []
+        for sc in subcards:
+            subcard_details.append({
+                "name":             sc.subboard_full_name or sc.subboard_name or 'Unknown',
+                "status":           sc.subboard_status.lower(),
+                "subboard_type":    sc.subboard_type or 'N/A',
+                "slot_number":      sc.slot_number or 'N/A',
+                "subslot_number":   sc.subslot_number or 'N/A',
+                "hardware_version": sc.hardware_version or 'N/A',
+                "serial_number":    sc.serial_number or 'N/A',
+                "description":      sc.description or '',
+                "manufactured_on":  sc.manufactured_on or 'N/A',
+            })
+
         return Response({
             "device_name": device.name,
-            "device_ip": device.loopback_ip,
-            "vendor": device.vendor,
+            "device_ip":   device.loopback_ip,
+            "vendor":      device.vendor,
             "verification_results": {
-                "ports": "OK" if ports_ok else "Alarm - Down ports detected",
-                "cards": "OK" if cards_ok else "Alarm - Abnormal cards detected",
-                "sfps": "OK" if sfps_ok else "Alarm - Abnormal SFPs detected"
+                "ports":    "OK" if ports_ok    else "Alarm - Down ports detected",
+                "cards":    "OK" if cards_ok    else "Alarm - Abnormal cards detected",
+                "sfps":     "OK" if sfps_ok     else "Alarm - Abnormal SFPs detected",
+                "subcards": "OK" if subcards_ok else "Alarm - Abnormal subcards detected",
             },
             "overall_status": "OK" if overall_ok else "Needs Attention",
             "counts": {
-                "total_ports": ports.count(),
-                "total_cards": cards.count(),
-                "total_sfps": sfps.count()
+                "total_ports":    ports.count(),
+                "total_cards":    cards.count(),
+                "total_sfps":     sfps.count(),
+                "total_subcards": subcards.count(),
             },
-            # These are the new arrays Angular will use!
-            "port_details": port_details,
-            "card_details": card_details,
-            "sfp_details": sfp_details
+            "port_details":    port_details,
+            "card_details":    card_details,
+            "sfp_details":     sfp_details,
+            "subcard_details": subcard_details,
         }, status=status.HTTP_200_OK)
-     
+
+
 class DashboardStatsView(APIView):
-    """
-    GET /api/dashboard/stats/
-    Returns aggregate stats for the NOC dashboard.
-    """
     def get(self, request):
-        # ── Devices ──────────────────────────────────────────
         total_routers  = Router.objects.count()
         total_switches = Switch.objects.count()
 
@@ -168,7 +176,6 @@ class DashboardStatsView(APIView):
             .order_by('vendor')
         )
 
-        # ── Backhaul Links ───────────────────────────────────
         total_links  = BackhaulLink.objects.count()
         normal_links = BackhaulLink.objects.filter(alarm_severity='normal').count()
         alarm_links  = total_links - normal_links
@@ -179,30 +186,33 @@ class DashboardStatsView(APIView):
             .order_by('alarm_severity')
         )
 
-        # ── Hardware ─────────────────────────────────────────
-        total_ports = Port.objects.count()
-        ports_up    = Port.objects.filter(oper_status='up').count()
-        ports_down  = Port.objects.filter(oper_status='down').count()
+        total_ports    = Port.objects.count()
+        ports_up       = Port.objects.filter(oper_status='up').count()
+        ports_down     = Port.objects.filter(oper_status='down').count()
 
         total_cards    = Card.objects.count()
         cards_normal   = Card.objects.filter(board_status='normal').count()
         cards_abnormal = Card.objects.filter(board_status='abnormal').count()
 
-        total_sfps    = SFP.objects.count()
-        sfps_normal   = SFP.objects.filter(rx_status='normal').count()
-        sfps_abnormal = SFP.objects.filter(rx_status='abnormal').count()
+        total_sfps     = SFP.objects.count()
+        sfps_normal    = SFP.objects.filter(rx_status='normal').count()
+        sfps_abnormal  = SFP.objects.filter(rx_status='abnormal').count()
+
+        total_subcards    = SubCard.objects.count()
+        subcards_normal   = SubCard.objects.filter(subboard_status='normal').count()
+        subcards_abnormal = SubCard.objects.filter(subboard_status='abnormal').count()
 
         return Response({
             "devices": {
-                "routers":          total_routers,
-                "switches":         total_switches,
+                "routers":           total_routers,
+                "switches":          total_switches,
                 "routers_by_vendor": routers_by_vendor,
             },
             "backhaul_links": {
-                "total":           total_links,
-                "normal":          normal_links,
-                "alarm":           alarm_links,
-                "by_alarm_level":  links_by_alarm,
+                "total":          total_links,
+                "normal":         normal_links,
+                "alarm":          alarm_links,
+                "by_alarm_level": links_by_alarm,
             },
             "hardware": {
                 "ports": {
@@ -219,15 +229,20 @@ class DashboardStatsView(APIView):
                     "total":    total_sfps,
                     "normal":   sfps_normal,
                     "abnormal": sfps_abnormal,
-                }
+                },
+                "subcards": {
+                    "total":    total_subcards,
+                    "normal":   subcards_normal,
+                    "abnormal": subcards_abnormal,
+                },
             }
         }, status=status.HTTP_200_OK)
+
+
 @api_view(['GET'])
 def get_port_id(request):
     router_id = request.query_params.get('router_id')
     port_name = request.query_params.get('port_name')
-    
     router = get_object_or_404(Router, id=router_id)
-    port = get_object_or_404(Port, ne_name=router.name, port_full_name=port_name)
-    
+    port   = get_object_or_404(Port, ne_name=router.name, port_full_name=port_name)
     return Response({'port_id': port.id})

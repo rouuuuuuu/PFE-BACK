@@ -141,3 +141,35 @@ class SFP(models.Model):
     class Meta:
         ordering = ['ne_name', 'port_name']
         verbose_name = 'SFP'
+class SubCard(models.Model):
+
+    STATUS_CHOICES = [
+        ('normal',   'Normal'),
+        ('abnormal', 'Abnormal'),
+        ('unknown',  'Unknown'),
+    ]
+
+    ne_name          = models.CharField(max_length=100)
+    ne_type          = models.CharField(max_length=100, blank=True)
+    subboard_full_name = models.CharField(max_length=200, blank=True)
+    subboard_name    = models.CharField(max_length=100, blank=True)
+    subboard_type    = models.CharField(max_length=100, blank=True)
+    subrack_id       = models.CharField(max_length=20, blank=True)
+    slot_number      = models.CharField(max_length=20, blank=True)
+    subslot_number   = models.CharField(max_length=20, blank=True)
+    hardware_version = models.CharField(max_length=200, blank=True)
+    software_version = models.CharField(max_length=200, blank=True)
+    serial_number    = models.CharField(max_length=200, blank=True)
+    subboard_status  = models.CharField(max_length=20, choices=STATUS_CHOICES, default='normal')
+    description      = models.TextField(blank=True)
+    model            = models.CharField(max_length=200, blank=True)
+    manufactured_on  = models.CharField(max_length=200, blank=True)
+    imported_at      = models.DateTimeField(auto_now_add=True)
+    updated_at       = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.ne_name} — {self.subboard_full_name} ({self.subboard_status})'
+
+    class Meta:
+        ordering = ['ne_name', 'subboard_full_name']
+        verbose_name = 'SubCard'

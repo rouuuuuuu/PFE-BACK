@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Router, Switch, Port, Card, SFP
+from .models import Router, Switch, Port, Card, SFP, SubCard
 
 @admin.register(Router)
 class RouterAdmin(admin.ModelAdmin):
@@ -30,3 +30,9 @@ class SFPAdmin(admin.ModelAdmin):
     list_display  = ['ne_name', 'port_name', 'optical_type', 'rx_power', 'tx_power', 'rx_status', 'tx_status']
     list_filter   = ['rx_status', 'tx_status', 'fiber_type']
     search_fields = ['ne_name', 'port_name', 'manufacturer', 'serial_number']
+
+@admin.register(SubCard)
+class SubCardAdmin(admin.ModelAdmin):
+    list_display  = ['ne_name', 'subboard_full_name', 'subboard_type', 'slot_number', 'subslot_number', 'subboard_status']
+    list_filter   = ['subboard_status']
+    search_fields = ['ne_name', 'subboard_full_name', 'serial_number']

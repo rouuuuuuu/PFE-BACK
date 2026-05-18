@@ -1,6 +1,6 @@
 import pandas as pd
 from django.core.management.base import BaseCommand
-from devices.models import Port, Card, SFP
+from devices.models import Port, Card, SFP, SubCard
 
 
 class Command(BaseCommand):
@@ -93,3 +93,33 @@ class Command(BaseCommand):
             except Exception as e:
                 self.stdout.write(self.style.WARNING(f'⚠️  SFP skipped: {e}'))
         self.stdout.write(self.style.SUCCESS(f' {count} SFPs imported'))
+        
+# ── Import SubCards ──────────────────────────────────────
+        self.stdout.write('Importing subcards...')
+        df = pd.read_excel('/home/roua/bd/sub-card_info.xlsx')
+        count = 0
+        for _, row in df.iterrows():
+            try:
+                SubCard.objects.update_or_create(
+                    ne_name=str(row['NE Name']),
+                    subboard_full_name=str(row['Subboard Full Name']) if str(row['Subboard Full Name']) != 'nan' else '',
+                    subslot_number=str(row['Subslot Number']) if str(row['Subslot Number']) != 'nan' else '',
+                    defaults={
+                        'ne_type':          str(row['NE Type (MPU Type)']) if str(row['NE Type (MPU Type)']) != 'nan' else '',
+                        'subboard_name':    str(row['Subboard Name']) if str(row['Subboard Name']) != 'nan' else '',
+                        'subboard_type':    str(row['Subboard Type']) if str(row['Subboard Type']) != 'nan' else '',
+                        'subrack_id':       str(row['Subrack ID']) if str(row['Subrack ID']) != 'nan' else '',
+                        'slot_number':      str(row['Slot Number']) if str(row['Slot Number']) != 'nan' else '',
+                        'hardware_version': str(row['Hardware Version']) if str(row['Hardware Version']) != 'nan' else '',
+                        'software_version': str(row['Software Version']) if str(row['Software Version']) != 'nan' else '',
+                        'serial_number':    str(row['SN(Bar Code)']) if str(row['SN(Bar Code)']) != 'nan' else '',
+                        'subboard_status':  str(row['Subboard Status']).lower() if str(row['Subboard Status']) != 'nan' else 'unknown',
+                        'description':      str(row['Description']) if str(row['Description']) != 'nan' else '',
+                        'model':            str(row['Model']) if str(row['Model']) != 'nan' else '',
+                        'manufactured_on':  str(row['Manufactured On']) if str(row['Manufactured On']) != 'nan' else '',
+                    }
+                )
+                count += 1
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f'⚠️  SubCard skipped: {e}'))
+        self.stdout.write(self.style.SUCCESS(f'✅ {count} subcards imported'))
