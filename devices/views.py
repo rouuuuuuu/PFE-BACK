@@ -164,9 +164,36 @@ class HardwareVerifyView(APIView):
             "subcard_details": subcard_details,
         }, status=status.HTTP_200_OK)
 
-
 class DashboardStatsView(APIView):
     def get(self, request):
+        
+        # --- NEW: Helper Function for Hardware Breakdowns ---
+        def get_top_breakdown(model, field_name, limit=4):
+            """
+            Groups by field_name, counts occurrences, sorts by highest count.
+            Takes the top N (limit), and sums the rest into 'Other'.
+            """
+            queryset = model.objects.values(field_name).annotate(count=Count('id')).order_by('-count')
+            
+            breakdown = {}
+            other_count = 0
+            
+            for index, item in enumerate(queryset):
+                key = item[field_name]
+                if not key or str(key).strip() == '':
+                    key = 'Unknown'
+                
+                if index < limit:
+                    breakdown[key] = item['count']
+                else:
+                    other_count += item['count']
+                    
+            if other_count > 0:
+                breakdown['Other'] = other_count
+                
+            return breakdown
+
+        # --- EXISTING: Basic Counts ---
         total_routers  = Router.objects.count()
         total_switches = Switch.objects.count()
 
@@ -202,6 +229,23 @@ class DashboardStatsView(APIView):
         subcards_normal   = SubCard.objects.filter(subboard_status='normal').count()
         subcards_abnormal = SubCard.objects.filter(subboard_status='abnormal').count()
 
+        # --- NEW: Generate Breakdowns ---
+        hardware_breakdowns = {
+            "ports": {
+                "by_rate": get_top_breakdown(Port, 'port_rate', limit=4)
+            },
+            "cards": {
+                "by_board_type": get_top_breakdown(Card, 'board_type', limit=4)
+            },
+            "sfps": {
+                "by_type": get_top_breakdown(SFP, 'wavelength', limit=4)
+            },
+            "subcards": {
+                "by_board_type": get_top_breakdown(SubCard, 'subboard_type', limit=4)
+            }
+        }
+
+        # --- COMBINED RESPONSE ---
         return Response({
             "devices": {
                 "routers":           total_routers,
@@ -235,10 +279,11 @@ class DashboardStatsView(APIView):
                     "normal":   subcards_normal,
                     "abnormal": subcards_abnormal,
                 },
-            }
+            },
+            # Add the new breakdowns object here!
+            "hardware_breakdowns": hardware_breakdowns
+            
         }, status=status.HTTP_200_OK)
-
-
 @api_view(['GET'])
 def get_port_id(request):
     router_id = request.query_params.get('router_id')
