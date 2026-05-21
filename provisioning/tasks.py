@@ -4,11 +4,12 @@ from celery import shared_task
 from django.utils import timezone
 from netmiko import ConnectHandler
 from napalm import get_network_driver
+from jinja2 import Template
+from abc import ABC, abstractmethod
 from .models import BandwidthUpgrade
 
 logger = logging.getLogger(__name__)
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
-
 
 @shared_task(bind=True)
 def execute_bandwidth_upgrade(self, upgrade_id):
@@ -24,7 +25,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
     device = upgrade.device
     lock_key = f'device_lock_{device.loopback_ip}'
 
-    # --- 1. Acquire Redis Lock ---
     lock_acquired = redis_client.set(lock_key, str(upgrade_id), nx=True, ex=600)
 
     if not lock_acquired:
@@ -34,12 +34,10 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         raise self.retry(countdown=120, max_retries=5)
 
     try:
-        # --- 2. Mark as Running ---
         upgrade.status = 'running'
         upgrade.started_at = timezone.now()
         upgrade.save()
 
-        # --- 3. Real Hardware Execution ---
         if device.vendor.lower() == 'huawei':
             device_params = {
                 'device_type': 'huawei',
@@ -72,7 +70,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
             )
             juniper_device.open()
 
-            # Juniper traffic shaping is typically handled under class-of-service
             config_string = f'''
             set class-of-service interfaces {upgrade.interface} shaping-rate {upgrade.new_bandwidth_mbps}m
             '''
@@ -87,7 +84,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         else:
             raise ValueError(f"Unsupported vendor: {device.vendor}")
 
-        # --- 4. Mark as Completed ---
         upgrade.status = 'completed'
         upgrade.execution_output = output
         upgrade.completed_at = timezone.now()
@@ -101,22 +97,20 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         logger.error(f"Upgrade failed for {upgrade_id}: {str(e)}")
 
     finally:
-        # --- 5. Always Release Lock ---
         redis_client.delete(lock_key)
 
     return upgrade.status
+
 
 @shared_task
 def fetch_device_interfaces(device_id):
     """
     Connects to a device to retrieve a list of active interfaces.
-    Supports Huawei (Netmiko) and Juniper (NAPALM).
     """
     from devices.models import Router
     try:
         device = Router.objects.get(id=device_id)
 
-        # ─── HUAWEI LOGIC ──────────────────────────────────────────
         if device.vendor.lower() == 'huawei':
             device_params = {
                 'device_type': 'huawei',
@@ -131,7 +125,6 @@ def fetch_device_interfaces(device_id):
 
             return {'status': 'success', 'data': output}
 
-        # ─── JUNIPER LOGIC ─────────────────────────────────────────
         elif device.vendor.lower() == 'juniper':
             driver = get_network_driver('junos')
             juniper_device = driver(
@@ -142,14 +135,10 @@ def fetch_device_interfaces(device_id):
             )
             juniper_device.open()
             
-            # Use NAPALM's cli() method to get the raw text output 
-            # equivalent to Huawei's display command
             cli_result = juniper_device.cli(['show interfaces descriptions'])
             juniper_device.close()
             
-            # NAPALM returns a dictionary where the key is the command executed
             output = cli_result.get('show interfaces descriptions', 'No output received.')
-
             return {'status': 'success', 'data': output}
 
         else:
@@ -157,6 +146,8 @@ def fetch_device_interfaces(device_id):
 
     except Exception as e:
         return {'status': 'error', 'message': str(e)}
+
+
 @shared_task(bind=True)
 def execute_port_reservation(self, port_id, router_id, description):
     """
@@ -171,18 +162,15 @@ def execute_port_reservation(self, port_id, router_id, description):
         return "Port or Router record not found."
 
     lock_key = f'device_lock_{router.loopback_ip}'
-
-    # --- 1. Acquire Redis Lock ---
     lock_acquired = redis_client.set(lock_key, f"port_res_{port_id}", nx=True, ex=300)
 
     if not lock_acquired:
         port.admin_status = 'inactive'
         port.save()
-        logger.warning(f"Device {router.loopback_ip} is busy. Reservation for {port.port_full_name} queued/retrying.")
+        logger.warning(f"Device {router.loopback_ip} is busy. Reservation queued.")
         raise self.retry(countdown=60, max_retries=3)
 
     try:
-        # --- 3. Real Hardware Execution ---
         if router.vendor.lower() == 'huawei':
             device_params = {
                 'device_type': 'huawei',
@@ -196,9 +184,8 @@ def execute_port_reservation(self, port_id, router_id, description):
                 net_connect.send_command(f'interface {port.port_full_name}', expect_string=r'\[')
                 net_connect.send_command(f'description {description}', expect_string=r'\[')
                 net_connect.send_command('undo shutdown', expect_string=r'\[')
-                output = net_connect.send_command('commit', expect_string=r'\[')  # commit before return valable lel prsq all huawei routers 
+                output = net_connect.send_command('commit', expect_string=r'\[') 
                 net_connect.send_command('return', expect_string=r'\>')
-                logger.info(f"Huawei Output: {output}")
 
         elif router.vendor.lower() == 'juniper':
             driver = get_network_driver('junos')
@@ -216,34 +203,163 @@ def execute_port_reservation(self, port_id, router_id, description):
             device.load_merge_candidate(config=config_string)
             device.commit_config()
             device.close()
-            output = f"Juniper Config Committed for {port.port_full_name}"
-            logger.info(output)
 
         else:
             raise ValueError(f"Unsupported vendor: {router.vendor}")
 
-        # --- 4. Database Reconciliation (SUCCESS) ---
         port.admin_status = 'active'
         port.oper_status = 'up'
         port.port_description = description
         port.save()
-
         return f"Successfully provisioned {port.port_full_name}"
 
     except Exception as e:
-        # --- 5. Database Reconciliation (FAILURE) ---
         logger.error(f"Failed to provision port {port.port_full_name}: {str(e)}")
         port.admin_status = 'inactive'
         port.save()
         raise e
 
     finally:
-        # --- 6. Always Release Lock ---
         redis_client.delete(lock_key)
+
+
+# ==========================================
+# 1. BUSINESS LOGIC LAYER
+# ==========================================
+def build_provisioning_payload(port_name, params):
+    """
+    Extracts raw JSON parameters and calculates all necessary network variables.
+    """
+    subnet_type = params.get('subnet_type', '/31')
+    media_type = params.get('media_type', 'fo').lower()
+    debit_mbps = int(params.get('debit_mbps', 0))
+    
+    # Calculate QoS (e.g., 5% overhead reduction for Microwave/FH)
+    qos_rate_mbps = int(debit_mbps * 0.95) if media_type == 'fh' else debit_mbps
+
+    # Subnet mask mapping
+    mask_map = {'/31': '255.255.255.254', '/29': '255.255.255.248', '/30': '255.255.255.252'}
+    
+    return {
+        'client_name': params.get('client_name', 'Unknown'),
+        'port_name': port_name,
+        'vlan': params.get('vlan'),
+        'pe_ip': params.get('pe_ip_address'),
+        'subnet_cidr': subnet_type,
+        'subnet_mask': mask_map.get(subnet_type, '255.255.255.0'),
+        'qos_mbps': qos_rate_mbps,
+        'qos_kbps': qos_rate_mbps * 1000,
+        'media_type': media_type.upper(),
+        'nat_mode': params.get('nat_mode'),
+        'ce_ip': params.get('ce_ip_address'),
+        'cust_lan_prefix': params.get('customer_lan_prefix', '0.0.0.0 0.0.0.0'),
+        'cust_lan_cidr': params.get('customer_lan_cidr', '0.0.0.0/0'),
+        'is_bundle': 'Eth-Trunk' in port_name or 'ae' in port_name.lower(),
+        'has_switch': params.get('has_switch', False),
+        'switch_ip': params.get('switch_ip')
+    }
+
+# ==========================================
+# 2. VENDOR STRATEGY & TEMPLATE LAYER
+# ==========================================
+class ProvisioningDriver(ABC):
+    def __init__(self, host, username, password):
+        self.host = host
+        self.username = username
+        self.password = password
+
+    @abstractmethod
+    def generate_config(self, payload): pass
+
+    @abstractmethod
+    def execute(self, config_payload): pass
+
+
+class HuaweiDriver(ProvisioningDriver):
+    TEMPLATE = """
+    system-view
+    interface {{ port_name }}.{{ vlan }}
+     description B2B_INTERNET_{{ media_type }}_{{ client_name }}
+     vlan-type dot1q {{ vlan }}
+     ip binding vpn-instance INTERNET
+     ip address {{ pe_ip }} {{ subnet_mask }}
+    {% if is_bundle %}
+     qos car inbound cir {{ qos_kbps }}
+     qos car outbound cir {{ qos_kbps }}
+    {% else %}
+     qos car inbound cir {{ qos_kbps }}
+     qos car outbound cir {{ qos_kbps }}
+    {% endif %}
+     quit
+    {% if nat_mode == 'sans_nat_avec_cpe' and ce_ip %}
+    ip route-static vpn-instance INTERNET {{ cust_lan_prefix }} {{ ce_ip }}
+    {% endif %}
+    commit
+    return
+    """
+
+    def generate_config(self, payload):
+        template = Template(self.TEMPLATE.strip())
+        return template.render(payload).split('\n')
+
+    def execute(self, commands):
+        device_params = {
+            'device_type': 'huawei',
+            'host': self.host,
+            'username': self.username,
+            'password': self.password,
+            'port': 22,
+        }
+        with ConnectHandler(**device_params) as conn:
+            output = conn.send_config_set(commands)
+        return output
+
+
+class JuniperDriver(ProvisioningDriver):
+    TEMPLATE = """
+    set interfaces {{ port_name }} vlan-tagging
+    set interfaces {{ port_name }} unit {{ vlan }} description "B2B_INTERNET_{{ media_type }}_{{ client_name }}"
+    set interfaces {{ port_name }} unit {{ vlan }} vlan-id {{ vlan }}
+    set interfaces {{ port_name }} unit {{ vlan }} family inet address {{ pe_ip }}{{ subnet_cidr }}
+    set routing-instances INTERNET interface {{ port_name }}.{{ vlan }}
+    {% if is_bundle %}
+    set class-of-service interfaces {{ port_name }} unit {{ vlan }} shaping-rate {{ qos_mbps }}m
+    {% else %}
+    set class-of-service interfaces {{ port_name }} unit {{ vlan }} shaping-rate {{ qos_mbps }}m
+    {% endif %}
+    {% if nat_mode == 'sans_nat_avec_cpe' and ce_ip %}
+    set routing-instances INTERNET routing-options static route {{ cust_lan_cidr }} next-hop {{ ce_ip }}
+    {% endif %}
+    """
+
+    def generate_config(self, payload):
+        template = Template(self.TEMPLATE.strip())
+        return template.render(payload)
+
+    def execute(self, config_string):
+        driver = get_network_driver('junos')
+        with driver(hostname=self.host, username=self.username, password=self.password) as device:
+            device.load_merge_candidate(config=config_string)
+            device.commit_config()
+        return f"Juniper Config Committed:\n{config_string}"
+
+def get_vendor_driver(vendor, host, username, password):
+    vendors = {
+        'huawei': HuaweiDriver,
+        'juniper': JuniperDriver
+    }
+    driver_class = vendors.get(vendor.lower())
+    if not driver_class:
+        raise ValueError(f"Unsupported vendor: {vendor}")
+    return driver_class(host, username, password)
+
+# ==========================================
+# 3. CELERY COORDINATOR LAYER
+# ==========================================
 @shared_task(bind=True)
 def execute_internet_provisioning(self, task_id, router_id, port_id):
     """
-    Executes Internet Service provisioning reading from the generic ProvisioningTask model.
+    Main entry point. Handles orchestration, topology checks, and state.
     """
     from devices.models import Router, Port, ProvisioningTask
     
@@ -252,110 +368,50 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
         router = Router.objects.get(id=router_id)
         port = Port.objects.get(id=port_id)
     except Exception:
-        return "Task, Router, or Port record not found."
+        return "Database records not found."
 
-    # Extract all parameters from the JSON field
-    params = task.parameters
-    client_name = params.get('client_name', 'Unknown')
-    vlan = params.get('vlan')
-    debit_mbps = int(params.get('debit_mbps', 0))
-    pe_ip_address = params.get('pe_ip_address')
-    subnet_mask = params.get('subnet_mask')
-    subnet_type = params.get('subnet_type', '/31') # e.g. /31 or /29 for JunOS
+    payload = build_provisioning_payload(port.port_full_name, task.parameters)
 
     lock_key = f'device_lock_{router.loopback_ip}'
-    lock_acquired = redis_client.set(lock_key, f"internet_task_{task_id}", nx=True, ex=300)
-
-    if not lock_acquired:
-        port.admin_status = 'inactive'
-        port.save()
-        logger.warning(f"Device {router.loopback_ip} busy. Retrying Internet provisioning.")
+    if not redis_client.set(lock_key, f"internet_task_{task_id}", nx=True, ex=300):
         raise self.retry(countdown=60, max_retries=3)
 
     try:
         task.status = 'running'
-        task.started_at = timezone.now()
         task.save()
 
-        # ─── HUAWEI LOGIC (Netmiko) ───
-        if router.vendor.lower() == 'huawei':
-            device_params = {
-                'device_type': 'huawei',
-                'host': router.loopback_ip,
-                'username': router.ssh_username,
-                'password': router.ssh_password,
-                'port': 22,
-            }
-            
-            sub_interface = f"{port.port_full_name}.{vlan}"
-            commands = [
-                'system-view',
-                f'interface {sub_interface}',
-                f'description B2B_INTERNET_{client_name}',
-                f'vlan-type dot1q {vlan}',
-                'ip binding vpn-instance INTERNET',
-                f'ip address {pe_ip_address} {subnet_mask}',
-                f'qos car inbound cir {debit_mbps * 1000}',
-                f'qos car outbound cir {debit_mbps * 1000}',
-                'commit',
-                'return'
-            ]
+        # Handle Switched Topology
+        if payload.get('has_switch') and payload.get('switch_ip'):
+            logger.info(f"Switched Topology: Triggering L2 VLAN {payload['vlan']} on Switch {payload['switch_ip']}")
+            # execute_switch_l2_provisioning.delay(payload['switch_ip'], payload['vlan'], payload['client_name'])
 
-            with ConnectHandler(**device_params) as conn:
-                output = conn.send_config_set(commands)
-                logger.info(f"Huawei Internet Config: {output}")
+        # Delegate to Vendor Driver
+        driver = get_vendor_driver(
+            router.vendor, 
+            router.loopback_ip, 
+            router.ssh_username, 
+            router.ssh_password
+        )
+        
+        config_data = driver.generate_config(payload)
+        execution_output = driver.execute(config_data)
 
-        # ─── JUNIPER LOGIC (NAPALM) ───
-        elif router.vendor.lower() == 'juniper':
-            driver = get_network_driver('junos')
-            juniper_device = driver(
-                hostname=router.loopback_ip,
-                username=router.ssh_username,
-                password=router.ssh_password,
-                optional_args={'port': 22}
-            )
-            juniper_device.open()
-
-            junos_config = f'''
-            set interfaces {port.port_full_name} vlan-tagging
-            set interfaces {port.port_full_name} unit {vlan} description "B2B_INTERNET_{client_name}"
-            set interfaces {port.port_full_name} unit {vlan} vlan-id {vlan}
-            set interfaces {port.port_full_name} unit {vlan} family inet address {pe_ip_address}{subnet_type}
-            set routing-instances INTERNET interface {port.port_full_name}.{vlan}
-            set class-of-service interfaces {port.port_full_name} unit {vlan} shaping-rate {debit_mbps}m
-            '''
-
-            juniper_device.load_merge_candidate(config=junos_config)
-            juniper_device.commit_config()
-            juniper_device.close()
-            output = f"Juniper Config Committed:\n{junos_config}"
-
-        else:
-            raise ValueError(f"Unsupported vendor: {router.vendor}")
-
-        # ─── SUCCESS RECONCILIATION ───
+        # State Reconciliation (Success)
         task.status = 'completed'
-        task.result = output
-        task.completed_at = timezone.now()
-        task.save()
-
-        port.admin_status = 'active'
-        port.oper_status = 'up'
-        port.port_description = f"B2B_INTERNET_{client_name}"
-        port.save()
-
-        return f"Internet provisioned for {client_name}"
-
-    except Exception as e:
-        # ─── FAILURE RECONCILIATION ───
-        logger.error(f"Internet provisioning failed: {str(e)}")
-        task.status = 'failed'
-        task.result = str(e)
-        task.completed_at = timezone.now()
+        task.result = execution_output
         task.save()
         
-        port.admin_status = 'inactive'
+        port.admin_status = 'active'
+        port.port_description = f"B2B_INTERNET_{payload['media_type']}_{payload['client_name']}"
         port.save()
+
+        return f"Internet provisioned for {payload['client_name']}"
+
+    except Exception as e:
+        logger.error(f"Provisioning failed on {router.loopback_ip}: {str(e)}")
+        task.status = 'failed'
+        task.result = str(e)
+        task.save()
         raise e
 
     finally:
