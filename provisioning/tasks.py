@@ -137,11 +137,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
     return upgrade.status
 
-   
-
-  
-
-  
 
 @shared_task
 def fetch_device_interfaces(device_id):
@@ -233,15 +228,30 @@ def execute_port_reservation(self, port_id, router_id, description):
             device = driver(
                 hostname=router.loopback_ip,
                 username=router.ssh_username,
-                password=router.ssh_password
+                password=router.ssh_password,
+                optional_args={'port': 830}
             )
             device.open()
 
-            config_string = f'''
-            delete interfaces {port.port_full_name} disable
-            set interfaces {port.port_full_name} description "{description}"
-            '''
-            device.load_merge_candidate(config=config_string)
+            # 1. Strip '.0' so we modify the physical hardware, not the logical unit
+            junos_port = port.port_full_name[:-2] if port.port_full_name.endswith('.0') else port.port_full_name
+
+            # 2. Try to remove 'disable' and set description. Catch strict PyEZ warnings safely.
+            try:
+                config_string = f'''
+                delete interfaces {junos_port} disable
+                set interfaces {junos_port} description "{description}"
+                '''
+                device.load_merge_candidate(config=config_string)
+            except Exception as e:
+                # If Junos warns us the 'disable' statement wasn't there, it's already enabled!
+                if 'statement not found' in str(e):
+                    device.discard_config() # Clean the candidate buffer
+                    config_string = f'set interfaces {junos_port} description "{description}"'
+                    device.load_merge_candidate(config=config_string) # Merge only the description
+                else:
+                    raise e
+
             device.commit_config()
             device.close()
 
@@ -456,35 +466,64 @@ ip address {{ pe_ip }} {{ subnet_mask }}
 
         return "\n".join(output_lines)
 
-
 class JuniperDriver(ProvisioningDriver):
     TEMPLATE = """
-set interfaces {{ port_name }} vlan-tagging
-set interfaces {{ port_name }} unit {{ vlan }} description "B2B_INTERNET_{{ media_type }}_{{ client_name }}"
-set interfaces {{ port_name }} unit {{ vlan }} vlan-id {{ vlan }}
-set interfaces {{ port_name }} unit {{ vlan }} family inet address {{ pe_ip }}{{ subnet_cidr }}
-set routing-instances INTERNET interface {{ port_name }}.{{ vlan }}
-set class-of-service interfaces {{ port_name }} unit {{ vlan }} shaping-rate {{ qos_mbps }}m
+delete interfaces {{ junos_port }} unit 0
+set interfaces {{ junos_port }} vlan-tagging
+set interfaces {{ junos_port }} flexible-vlan-tagging
+set interfaces {{ junos_port }} per-unit-scheduler
+set interfaces {{ junos_port }} unit {{ vlan }} description "B2B_INTERNET_{{ media_type }}_{{ client_name }}"
+set interfaces {{ junos_port }} unit {{ vlan }} vlan-id {{ vlan }}
+set interfaces {{ junos_port }} unit {{ vlan }} family inet address {{ pe_ip }}{{ subnet_cidr }}
+set routing-instances INTERNET interface {{ junos_port }}.{{ vlan }}
+set class-of-service interfaces {{ junos_port }} unit {{ vlan }} shaping-rate {{ qos_mbps }}m
 {% if nat_mode == 'sans_nat_avec_cpe' and ce_ip %}
 set routing-instances INTERNET routing-options static route {{ cust_lan_cidr }} next-hop {{ ce_ip }}
 {% endif %}
 """
-
+ 
     def generate_config(self, payload):
+        # Junos uses the physical interface name for 'set interfaces' and unit config.
+        # Strip trailing '.0' that some NMS databases append (ge-0/0/1.0 → ge-0/0/1).
+        port_name = payload['port_name']
+        junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
+ 
+        render_payload = {**payload, 'junos_port': junos_port}
         template = Template(self.TEMPLATE.strip())
-        return template.render(payload)
-
+        return template.render(render_payload)
+ 
     def execute(self, config_string):
+        import time
+        from napalm.base.exceptions import ConnectionException
+ 
         driver = get_network_driver('junos')
-        with driver(
-            hostname=self.host,
-            username=self.username,
-            password=self.password,
-        ) as device:
-            device.load_merge_candidate(config=config_string)
-            device.commit_config()
-        return f"Juniper Config Committed:\n{config_string}"
-
+        # NAPALM/PyEZ connects via NETCONF — default port is 830, not 22.
+        # Retry up to 5 times with 15s gaps to handle slow JunOS boot in EVE-NG.
+        last_exc = None
+        for attempt in range(1, 6):
+            try:
+                with driver(
+                    hostname=self.host,
+                    username=self.username,
+                    password=self.password,
+                    optional_args={'port': 830},
+                ) as device:
+                    device.load_merge_candidate(config=config_string)
+                    device.commit_config()
+                return f"Juniper Config Committed:\n{config_string}"
+            except ConnectionException as e:
+                last_exc = e
+                logger.warning(
+                    f"Juniper NETCONF not ready on {self.host} "
+                    f"(attempt {attempt}/5) — retrying in 15s"
+                )
+                time.sleep(15)
+ 
+        raise ConnectionException(
+            f"Could not connect to {self.host} after 5 attempts: {last_exc}"
+        )
+ 
+ 
 
 def get_vendor_driver(vendor, host, username, password):
     vendors = {
