@@ -308,7 +308,7 @@ class StartProvisioningView(APIView):
                 )
 
             # ─── INTERNET SERVICE ROUTING ───
-            if task.task_type == 'internet_service':
+            if task.task_type == 'internet':
                 port_id = task.parameters.get('port_id')
                 
                 if not port_id:
