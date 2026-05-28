@@ -13,10 +13,6 @@ redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
 @shared_task(bind=True)
 def execute_bandwidth_upgrade(self, upgrade_id):
-    """
-    Executes the bandwidth upgrade on the device with Redis locking.
-    Supports both Huawei (Netmiko) and Juniper (Napalm).
-    """
     try:
         upgrade = BandwidthUpgrade.objects.get(upgrade_id=upgrade_id)
     except BandwidthUpgrade.DoesNotExist:
@@ -24,7 +20,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
     device = upgrade.device
     lock_key = f'device_lock_{device.loopback_ip}'
-
     lock_acquired = redis_client.set(lock_key, str(upgrade_id), nx=True, ex=600)
 
     if not lock_acquired:
@@ -33,7 +28,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         upgrade.save()
         raise self.retry(countdown=120, max_retries=5)
 
-    # ─── OUTER TRY BLOCK FOR MAIN EXECUTION ───
     try:
         upgrade.status = 'running'
         upgrade.started_at = timezone.now()
@@ -49,10 +43,8 @@ def execute_bandwidth_upgrade(self, upgrade_id):
                 'port': 22,
                 'global_delay_factor': 2,
             }
-
             output_lines = []
 
-            # Your inner helper function
             def _send(conn, cmd, sleep=2, check_error=True):
                 conn.write_channel(cmd + '\n')
                 time.sleep(sleep)
@@ -62,15 +54,14 @@ def execute_bandwidth_upgrade(self, upgrade_id):
                     raise RuntimeError(f'Device error on "{cmd}": {out.strip()}')
                 return out
 
-            # ─── NESTED CONNECT HANDLER CONTEXT ───
             with ConnectHandler(**device_params) as conn:
                 conn.write_channel('system-view\n')
                 time.sleep(3)
-                conn.read_channel()  # flush buffer
+                conn.read_channel()
 
                 _send(conn, f'interface {upgrade.interface}', sleep=3)
                 _send(conn, f'bandwidth {upgrade.new_bandwidth_mbps * 1000}')
-                
+
                 conn.write_channel('quit\n')
                 time.sleep(2)
                 conn.read_channel()
@@ -92,7 +83,7 @@ def execute_bandwidth_upgrade(self, upgrade_id):
                 f"interface {upgrade.interface}",
                 f"bandwidth {upgrade.new_bandwidth_mbps * 1000}",
                 "commit",
-                "return"
+                "return",
             ])
 
         elif device.vendor.lower() == 'juniper':
@@ -100,14 +91,15 @@ def execute_bandwidth_upgrade(self, upgrade_id):
             juniper_device = driver(
                 hostname=device.loopback_ip,
                 username=device.ssh_username,
-                password=device.ssh_password
+                password=device.ssh_password,
+                optional_args={'port': 830},
             )
             juniper_device.open()
 
-            config_string = f'''
-            set class-of-service interfaces {upgrade.interface} shaping-rate {upgrade.new_bandwidth_mbps}m
-            '''
-
+            config_string = (
+                f"set class-of-service interfaces {upgrade.interface} "
+                f"shaping-rate {upgrade.new_bandwidth_mbps}m"
+            )
             juniper_device.load_merge_candidate(config=config_string)
             juniper_device.commit_config()
             juniper_device.close()
@@ -123,7 +115,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         upgrade.completed_at = timezone.now()
         upgrade.save()
 
-    # ─── OUTER EXCEPT CATCHES ALL ERRORS ABOVE ───
     except Exception as e:
         upgrade.status = 'failed'
         upgrade.execution_output = f"❌ Error: {str(e)}"
@@ -131,7 +122,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         upgrade.save()
         logger.error(f"Upgrade failed for {upgrade_id}: {str(e)}")
 
-    # ─── OUTER FINALLY RELEASES THE REDIS LOCK ───
     finally:
         redis_client.delete(lock_key)
 
@@ -140,9 +130,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
 @shared_task
 def fetch_device_interfaces(device_id):
-    """
-    Connects to a device to retrieve a list of active interfaces.
-    """
     from devices.models import Router
     try:
         device = Router.objects.get(id=device_id)
@@ -155,10 +142,8 @@ def fetch_device_interfaces(device_id):
                 'password': device.ssh_password,
                 'port': 22,
             }
-
             with ConnectHandler(**device_params) as conn:
                 output = conn.send_command("display interface description")
-
             return {'status': 'success', 'data': output}
 
         elif device.vendor.lower() == 'juniper':
@@ -167,13 +152,11 @@ def fetch_device_interfaces(device_id):
                 hostname=device.loopback_ip,
                 username=device.ssh_username,
                 password=device.ssh_password,
-                optional_args={'port': 22}
+                optional_args={'port': 830},
             )
             juniper_device.open()
-
             cli_result = juniper_device.cli(['show interfaces descriptions'])
             juniper_device.close()
-
             output = cli_result.get('show interfaces descriptions', 'No output received.')
             return {'status': 'success', 'data': output}
 
@@ -186,9 +169,6 @@ def fetch_device_interfaces(device_id):
 
 @shared_task(bind=True)
 def execute_port_reservation(self, port_id, router_id, description):
-    """
-    Executes a port reservation (no shut + description) with Redis locking.
-    """
     from devices.models import Router, Port
 
     try:
@@ -208,20 +188,49 @@ def execute_port_reservation(self, port_id, router_id, description):
 
     try:
         if router.vendor.lower() == 'huawei':
+            import time
             device_params = {
                 'device_type': 'huawei',
                 'host': router.loopback_ip,
                 'username': router.ssh_username,
                 'password': router.ssh_password,
                 'port': 22,
+                'global_delay_factor': 2,
             }
-            with ConnectHandler(**device_params) as net_connect:
-                net_connect.send_command('system-view', expect_string=r'\[')
-                net_connect.send_command(f'interface {port.port_full_name}', expect_string=r'\[')
-                net_connect.send_command(f'description {description}', expect_string=r'\[')
-                net_connect.send_command('undo shutdown', expect_string=r'\[')
-                output = net_connect.send_command('commit', expect_string=r'\[')
-                net_connect.send_command('return', expect_string=r'\>')
+            output_lines = []
+
+            def _send(conn, cmd, sleep=2, check_error=True):
+                conn.write_channel(cmd + '\n')
+                time.sleep(sleep)
+                out = conn.read_channel()
+                output_lines.append(f'[{cmd}] => {out.strip()}')
+                if check_error and ('Error' in out or 'error' in out):
+                    raise RuntimeError(f'Device error on "{cmd}": {out.strip()}')
+                return out
+
+            with ConnectHandler(**device_params) as conn:
+                conn.write_channel('system-view\n')
+                time.sleep(3)
+                conn.read_channel()
+
+                _send(conn, f'interface {port.port_full_name}', sleep=3)
+                _send(conn, f'description {description}')
+                _send(conn, 'undo shutdown')
+
+                conn.write_channel('quit\n')
+                time.sleep(2)
+                conn.read_channel()
+
+                conn.write_channel('commit\n')
+                time.sleep(6)
+                out = conn.read_channel()
+                output_lines.append(f'[commit] => {out.strip()}')
+                if 'Error' in out or 'error' in out:
+                    raise RuntimeError(f'Commit failed: {out.strip()}')
+
+                conn.write_channel('return\n')
+                time.sleep(2)
+                conn.read_channel()
 
         elif router.vendor.lower() == 'juniper':
             driver = get_network_driver('junos')
@@ -229,28 +238,25 @@ def execute_port_reservation(self, port_id, router_id, description):
                 hostname=router.loopback_ip,
                 username=router.ssh_username,
                 password=router.ssh_password,
-                optional_args={'port': 830}
+                optional_args={'port': 830},
             )
             device.open()
 
-            # 1. Strip '.0' so we modify the physical hardware, not the logical unit
             junos_port = port.port_full_name[:-2] if port.port_full_name.endswith('.0') else port.port_full_name
 
-            # 2. Try to remove 'disable' and set description. Catch strict PyEZ warnings safely.
             try:
-                config_string = f'''
-                delete interfaces {junos_port} disable
-                set interfaces {junos_port} description "{description}"
-                '''
+                config_string = '\n'.join([
+                    f'delete interfaces {junos_port} disable',
+                    f'set interfaces {junos_port} description "{description}"',
+                ])
                 device.load_merge_candidate(config=config_string)
             except Exception as e:
-                # If Junos warns us the 'disable' statement wasn't there, it's already enabled!
                 if 'statement not found' in str(e):
-                    device.discard_config() # Clean the candidate buffer
+                    device.discard_config()
                     config_string = f'set interfaces {junos_port} description "{description}"'
-                    device.load_merge_candidate(config=config_string) # Merge only the description
+                    device.load_merge_candidate(config=config_string)
                 else:
-                    raise e
+                    raise
 
             device.commit_config()
             device.close()
@@ -278,12 +284,6 @@ def execute_port_reservation(self, port_id, router_id, description):
 # 1. BUSINESS LOGIC LAYER
 # ==========================================
 def _normalize_huawei_port(port_name: str) -> str:
-    """
-    Normalizes stored port names to match actual VRP CLI names.
-    EVE-NG Huawei images often report 'Ethernet1/0/X' in the CLI even when
-    the NMS database stores 'GigabitEthernet1/0/X'.
-    Extend the map below if your topology uses other aliases.
-    """
     replacements = [
         ('GigabitEthernet', 'Ethernet'),
         ('gigabitethernet', 'Ethernet'),
@@ -295,20 +295,12 @@ def _normalize_huawei_port(port_name: str) -> str:
 
 
 def build_provisioning_payload(port_name, params):
-    """
-    Extracts raw JSON parameters and calculates all necessary network variables.
-    port_name is normalized so template-generated interface names match the
-    actual VRP prompt (Ethernet1/0/X vs GigabitEthernet1/0/X).
-    """
     port_name = _normalize_huawei_port(port_name)
     subnet_type = params.get('subnet_type', '/31')
     media_type = params.get('media_type', 'fo').lower()
     debit_mbps = int(params.get('debit_mbps', 0))
 
-    # Calculate QoS (e.g., 5% overhead reduction for Microwave/FH)
     qos_rate_mbps = int(debit_mbps * 0.95) if media_type == 'fh' else debit_mbps
-
-    # Subnet mask mapping
     mask_map = {'/31': '255.255.255.254', '/29': '255.255.255.248', '/30': '255.255.255.252'}
 
     return {
@@ -350,11 +342,9 @@ class ProvisioningDriver(ABC):
 
 
 class HuaweiDriver(ProvisioningDriver):
-    # Only sub-interface config lines — no system-view, quit, commit, return.
-    # Those are navigation/session commands handled explicitly in execute().
-    # QoS is intentionally omitted: this NE40E EVE-NG image does not support
-    # 'traffic classifier' or 'qos car' on sub-interfaces. Add QoS back when
-    # targeting a real NE40E or a full-feature image.
+    # Only sub-interface config lines.
+    # QoS omitted: NE40E EVE-NG image does not support 'traffic classifier'
+    # or 'qos car' on sub-interfaces. Re-add when targeting a real NE40E.
     TEMPLATE = """
 interface {{ port_name }}.{{ vlan }}
 description B2B_INTERNET_{{ media_type }}_{{ client_name }}
@@ -368,12 +358,6 @@ ip address {{ pe_ip }} {{ subnet_mask }}
     )
 
     def generate_config(self, payload):
-        """
-        Returns a structured dict:
-          system_view_commands : always empty for now (no QoS on this image)
-          interface_commands   : sub-interface config lines
-          static_route         : optional ip route-static, sent after quit
-        """
         iface_lines = [
             line.strip()
             for line in Template(self.TEMPLATE.strip()).render(payload).splitlines()
@@ -385,19 +369,12 @@ ip address {{ pe_ip }} {{ subnet_mask }}
             static_route = Template(self.STATIC_ROUTE_TEMPLATE).render(payload)
 
         return {
-            'system_view_commands': [],   # empty — no system-view prep needed
+            'system_view_commands': [],
             'interface_commands': iface_lines,
             'static_route': static_route,
         }
 
     def execute(self, config_payload):
-        """
-        Uses write_channel + read_channel (raw SSH layer) so there is zero
-        dependency on prompt-pattern matching.  Every command is followed by
-        an explicit sleep that gives the emulated device time to respond, then
-        we drain whatever is in the receive buffer.  An 'Error' in the returned
-        text raises immediately so the Celery task fails fast and clearly.
-        """
         import time
 
         device_params = {
@@ -413,7 +390,6 @@ ip address {{ pe_ip }} {{ subnet_mask }}
         output_lines = []
 
         def _send(conn, cmd, sleep=2, check_error=True):
-            """Write a command, wait, read back, optionally raise on VRP error."""
             conn.write_channel(cmd + '\n')
             time.sleep(sleep)
             out = conn.read_channel()
@@ -427,31 +403,30 @@ ip address {{ pe_ip }} {{ subnet_mask }}
             # 1. Enter system-view
             conn.write_channel('system-view\n')
             time.sleep(3)
-            conn.read_channel()  # drain banner
+            conn.read_channel()
 
-            # 2. System-view-level commands (traffic classifier / behavior / policy)
+            # 2. System-view-level commands (empty for this image)
             for cmd in config_payload['system_view_commands']:
                 _send(conn, cmd)
 
-            # 3. Enter sub-interface view
+            # 3. Enter sub-interface (first iface command)
             iface_cmds = config_payload['interface_commands']
-            # first command is "interface Ethernet1/0/3.200" — enter it
             _send(conn, iface_cmds[0], sleep=3)
 
-            # 4. Remaining sub-interface config lines
+            # 4. Remaining sub-interface config
             for cmd in iface_cmds[1:]:
                 _send(conn, cmd)
 
-            # 5. Exit sub-interface view back to system-view
+            # 5. Exit sub-interface back to system-view
             conn.write_channel('quit\n')
             time.sleep(2)
-            conn.read_channel()  # drain
+            conn.read_channel()
 
-            # 6. Static route (system-view context, after quit)
+            # 6. Static route if needed
             if config_payload.get('static_route'):
                 _send(conn, config_payload['static_route'])
 
-            # 7. Commit (NE40E can be slow — give it 6 s)
+            # 7. Commit
             conn.write_channel('commit\n')
             time.sleep(6)
             out = conn.read_channel()
@@ -462,9 +437,10 @@ ip address {{ pe_ip }} {{ subnet_mask }}
             # 8. Return to user-view
             conn.write_channel('return\n')
             time.sleep(2)
-            conn.read_channel()  # drain
+            conn.read_channel()
 
         return "\n".join(output_lines)
+
 
 class JuniperDriver(ProvisioningDriver):
     TEMPLATE = """
@@ -481,24 +457,20 @@ set class-of-service interfaces {{ junos_port }} unit {{ vlan }} shaping-rate {{
 set routing-instances INTERNET routing-options static route {{ cust_lan_cidr }} next-hop {{ ce_ip }}
 {% endif %}
 """
- 
+
     def generate_config(self, payload):
-        # Junos uses the physical interface name for 'set interfaces' and unit config.
-        # Strip trailing '.0' that some NMS databases append (ge-0/0/1.0 → ge-0/0/1).
         port_name = payload['port_name']
         junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
- 
         render_payload = {**payload, 'junos_port': junos_port}
-        template = Template(self.TEMPLATE.strip())
-        return template.render(render_payload)
- 
+        return Template(self.TEMPLATE.strip()).render(render_payload)
+
+    
     def execute(self, config_string):
         import time
         from napalm.base.exceptions import ConnectionException
+        from jnpr.junos.utils.config import Config
  
         driver = get_network_driver('junos')
-        # NAPALM/PyEZ connects via NETCONF — default port is 830, not 22.
-        # Retry up to 5 times with 15s gaps to handle slow JunOS boot in EVE-NG.
         last_exc = None
         for attempt in range(1, 6):
             try:
@@ -508,22 +480,37 @@ set routing-instances INTERNET routing-options static route {{ cust_lan_cidr }} 
                     password=self.password,
                     optional_args={'port': 830},
                 ) as device:
-                    device.load_merge_candidate(config=config_string)
-                    device.commit_config()
+                    
+                    # 1. On récupère l'instance native Juniper PyEZ (Device)
+                    pyez_device = device.device
+                    
+                    # 2. On instancie l'outil de gestion de configuration natif
+                    cu = Config(pyez_device)
+                    
+                    # 3. On charge la configuration en forçant ignore_warning=True au niveau PyEZ
+                    # Cela court-circuite la sévérité artificielle de NAPALM
+                    cu.load(config_string, format="set", ignore_warning=True)
+                    
+                    # 4. On commit les changements de manière atomique
+                    cu.commit()
+                    
                 return f"Juniper Config Committed:\n{config_string}"
+            
             except ConnectionException as e:
                 last_exc = e
                 logger.warning(
-                    f"Juniper NETCONF not ready on {self.host} "
-                    f"(attempt {attempt}/5) — retrying in 15s"
+                    f"Juniper NETCONF non prêt sur {self.host} (tentative {attempt}/5) — nouvel essai dans 15s"
                 )
                 time.sleep(15)
- 
+            except Exception as e:
+                # Capture les autres exceptions critiques si la configuration est totalement invalide
+                logger.error(f"Erreur d'injection brute PyEZ: {str(e)}")
+                raise e
+
         raise ConnectionException(
-            f"Could not connect to {self.host} after 5 attempts: {last_exc}"
+            f"Impossible de se connecter à {self.host} après 5 tentatives: {last_exc}"
         )
- 
- 
+       
 
 def get_vendor_driver(vendor, host, username, password):
     vendors = {
@@ -541,9 +528,6 @@ def get_vendor_driver(vendor, host, username, password):
 # ==========================================
 @shared_task(bind=True)
 def execute_internet_provisioning(self, task_id, router_id, port_id):
-    """
-    Main entry point. Handles orchestration, topology checks, and state.
-    """
     from devices.models import Router, Port
     from provisioning.models import ProvisioningTask
 
@@ -564,7 +548,6 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
         task.status = 'running'
         task.save()
 
-        # Handle Switched Topology
         if payload.get('has_switch') and payload.get('switch_ip'):
             logger.info(
                 f"Switched Topology: Triggering L2 VLAN {payload['vlan']} "
@@ -574,7 +557,6 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
             #     payload['switch_ip'], payload['vlan'], payload['client_name']
             # )
 
-        # Delegate to Vendor Driver
         driver = get_vendor_driver(
             router.vendor,
             router.loopback_ip,
@@ -585,7 +567,6 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
         config_data = driver.generate_config(payload)
         execution_output = driver.execute(config_data)
 
-        # State Reconciliation (Success)
         task.status = 'completed'
         task.result = execution_output
         task.save()
