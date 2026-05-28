@@ -21,6 +21,8 @@ from django.contrib import admin
 from django.urls import path, include
 
 
+
+
 def ping(request):
     return JsonResponse({'status' : 'ok', 'message' : 'DRS 010 API RUNNING'})
 
@@ -31,6 +33,7 @@ urlpatterns = [
     path('api/', include('devices.urls')),
     path('api/provisioning/', include('provisioning.urls')),
     path('api/reporting/', include('reporting.urls')),
+    path('api/ai/', include('ai.urls')),
     path('api/inventory/', include('inventory.urls')), 
 ]
 

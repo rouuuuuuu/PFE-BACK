@@ -50,6 +50,7 @@ INSTALLED_APPS = [
 'provisioning',
 'monitoring',
 'reporting',
+'ai',
 'inventory',
 ]
 
@@ -166,3 +167,4 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+GROQ_API_KEY = "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"
