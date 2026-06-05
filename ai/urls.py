@@ -1,7 +1,12 @@
 from django.urls import path
 from . import views
 
+app_name = "ai_assistant"
+
 urlpatterns = [
-    path('alarm-analysis/', views.alarm_analysis_view),
-    path('nlp-provisioning/', views.nlp_provisioning_view),
+    # On garde l'endpoint des statistiques du tableau de bord
+    path("stats/", views.ai_stats, name="stats"),
+
+    # On utilise uniquement le chat local "From Scratch"
+    path("chat/native/", views.ai_chat_local_scratch, name="chat_native"),
 ]
