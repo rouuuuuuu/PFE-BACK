@@ -1,6 +1,7 @@
 import re
 import json
 import traceback
+import difflib  # <-- NOUVEL IMPORT POUR LE FUZZY MATCHING
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -8,12 +9,11 @@ from devices.models import Router, Switch, Port, Card, SFP
 from backhaul.models import BackhaulLink
 
 # ─────────────────────────────────────────────────────────────
-#  Utility function to clean and extract Node Name
+#  1. Utility: Extract Node Name from Text
 # ─────────────────────────────────────────────────────────────
 def extract_node_name(query_text):
     """
-    Robust extraction that isolates any substring matching telecom node identifiers.
-    Matches formats like 1001-TUN0005, ARI_0008, PE1, etc., anywhere in the string.
+    Extrait l'identifiant brut tapé par l'utilisateur.
     """
     complex_pattern = re.search(r'([a-z0-9]+[_-][a-z0-9_-]+)', query_text, re.IGNORECASE)
     if complex_pattern:
@@ -24,13 +24,59 @@ def extract_node_name(query_text):
         return pe_pattern.group(1).upper()
         
     words = query_text.upper().split()
-    exclude = ["SLOT", "CARTE", "PANNE", "BOARD", "CARD", "SPARE", "REMPLACEMENT", "POUR", "SUR", "RESEAU", "PORTS", "OF", "ON"]
+    exclude = ["SLOT", "CARTE", "PANNE", "BOARD", "CARD", "SPARE", "REMPLACEMENT", "POUR", "SUR", "RESEAU", "PORTS", "OF", "ON", "POR", "DOW"]
     for word in words:
         clean_word = re.sub(r'[^\w-]', '', word)
         if any(char.isdigit() for char in clean_word) and clean_word not in exclude:
             return clean_word
             
     return None
+
+# ─────────────────────────────────────────────────────────────
+#  2. NOUVEAU : Fuzzy Matching Engine
+# ─────────────────────────────────────────────────────────────
+def resolve_fuzzy_node(raw_name, model_class):
+    """
+    Prend le nom tapé avec des fautes de frappe et trouve le vrai nom en BDD.
+    """
+    if not raw_name:
+        return None
+        
+    all_names = list(model_class.objects.values_list('ne_name', flat=True).distinct())
+    raw_upper = raw_name.upper()
+    
+    # Étape 1 : Test direct classique (très rapide)
+    for name in all_names:
+        if name and raw_upper in name.upper():
+            return name
+            
+    # Étape 2 : Fuzzy Matching (Correction des fautes de frappe)
+    best_match = raw_name
+    highest_ratio = 0.0
+    
+    for name in all_names:
+        if not name: continue
+        
+        # On compare avec le nom complet
+        ratio_full = difflib.SequenceMatcher(None, raw_upper, name.upper()).ratio()
+        
+        # On compare avec les sous-parties du nom (ex: "1001-TUN0005" extrait de "1001-TUN0005 (To NAB0080)")
+        clean_parts = re.split(r'[\s()]+', name.upper())
+        ratio_part = 0.0
+        if clean_parts:
+            ratio_part = max([difflib.SequenceMatcher(None, raw_upper, part).ratio() for part in clean_parts if part])
+        
+        best_local_ratio = max(ratio_full, ratio_part)
+        
+        if best_local_ratio > highest_ratio:
+            highest_ratio = best_local_ratio
+            best_match = name
+            
+    # Si le score de similarité est d'au moins 60%, on applique la correction !
+    if highest_ratio >= 0.6:
+        return best_match
+        
+    return raw_name # Fallback au nom brut si aucune correspondance proche
 
 # ─────────────────────────────────────────────────────────────
 #  Capability 1: Native Predictive SFP Analysis Engine
@@ -154,21 +200,26 @@ def ai_chat_local_scratch(request):
         french_markers = ['sur', 'pour', 'panne', 'carte', 'remplacement', 'état', 'combien', 'résumé', 'réseau', 'planifier', 'dois']
         lang = 'fr' if any(marker in user_query_lower for marker in french_markers) else 'en'
         
-        # 1. SFP & Optical Diagnostics
-        if re.search(r'(sfp|optics|optical|rx_power|laser|fibre|optique|rx)', user_query_lower):
+        # 1. SFP & Optical Diagnostics (Ajout de spf, fiber)
+        if re.search(r'(sfp|spf|optics|optical|rx_power|laser|fibre|fiber|optique|rx)', user_query_lower):
             response_text = analyze_sfp_health_local(lang=lang)
             
-        # 2. Hardware Slot / Card Failures
-        elif re.search(r'(board|slot|card|carte|spare|panne|remplacement|failure)', user_query_lower):
+        # 2. Hardware Slot / Card Failures (Ajout de pane)
+        elif re.search(r'(board|slot|card|carte|spare|panne|pane|remplacement|failure)', user_query_lower):
             slot_match = re.search(r'slot\s*(\d+)', user_query_lower)
             slot = slot_match.group(1) if slot_match else "3"
             
-            node = extract_node_name(user_query)
-            response_text = find_spare_parts_local(node, slot, lang=lang)
+            raw_node = extract_node_name(user_query)
+            # APPLICATION DU FUZZY MATCHING AVANT RECHERCHE
+            resolved_node = resolve_fuzzy_node(raw_node, Card)
             
-        # 3. Dynamic Node Port Checking
-        elif re.search(r'port', user_query_lower):
-            node_name = extract_node_name(user_query)
+            response_text = find_spare_parts_local(resolved_node, slot, lang=lang)
+            
+        # 3. Dynamic Node Port Checking (Ajout de por, ports)
+        elif re.search(r'(port|por\b|ports|interface|prt)', user_query_lower):
+            raw_node = extract_node_name(user_query)
+            # APPLICATION DU FUZZY MATCHING AVANT RECHERCHE
+            node_name = resolve_fuzzy_node(raw_node, Port)
             
             if not node_name:
                 if lang == 'fr':
@@ -227,7 +278,7 @@ def ai_chat_local_scratch(request):
         else:
             if lang == 'fr':
                 response_text = (
-                    "👋 Moteur local Orange NOC en ligne. Posez une question sur l'infrastructure :\n\n"
+                    "👋 Salut! Iris est ici pour vous aidez. Posez une question sur l'infrastructure :\n\n"
                     "1. **Résumé global :** (ex: 'état du réseau')\n"
                     "2. **Diagnostics Optiques :** (ex: 'vérifier la santé des sfp')\n"
                     "3. **Gestion des pièces :** (ex: 'panne carte slot 10 sur 1001-TUN0005')\n"
@@ -235,7 +286,7 @@ def ai_chat_local_scratch(request):
                 )
             else:
                 response_text = (
-                    "👋 Orange NOC Local Engine online. Please supply a targeted infrastructure query:\n\n"
+                    "👋 Welcome! Iris Here to help. Please supply a targeted infrastructure query:\n\n"
                     "1. **Core Status Summary:** (e.g., 'network health statement')\n"
                     "2. **Optical Metrics Diagnostics:** (e.g., 'check sfp lasers')\n"
                     "3. **Spare Hardware Relocations:** (e.g., 'failed board on slot 10 of node 1001-TUN0005')\n"
