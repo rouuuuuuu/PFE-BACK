@@ -240,6 +240,31 @@ def reserve_port(request):
         'message': f'Port {available_port.port_full_name} locked. Configuring router now...'
     }, status=status.HTTP_202_ACCEPTED)
 # ─────────────────────────────────────────────────────────────
+#  PORT RESERVATION — LIST (Le complément manquant)
+# ─────────────────────────────────────────────────────────────
+@api_view(['GET'])
+def list_port_reservations(request):
+    """
+    Retourne la liste des réservations de ports.
+    """
+    # Ici, remplace 'PortReservation' par le nom de ton modèle s'il est différent
+    # Si tu n'as pas de modèle dédié et que tu veux juste lister les ports réservés :
+    from devices.models import Port
+    
+    reservations = Port.objects.filter(admin_status='pending_reservation').order_by('-id')
+    
+    data = []
+    for p in reservations:
+        data.append({
+            'id': p.id,
+            'port_name': p.port_full_name,
+            'router': p.ne_name,
+            'status': p.admin_status,
+            'description': p.port_description
+        })
+        
+    return Response(data)
+# ─────────────────────────────────────────────────────────────
 #  RETRY UPGRADE
 # ─────────────────────────────────────────────────────────────
 @api_view(['POST'])

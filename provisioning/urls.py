@@ -16,5 +16,6 @@ urlpatterns = [
     path('bandwidth-upgrades/<int:upgrade_id>/retry/', views.retry_upgrade, name='retry-upgrade'),
     path('fetch-interfaces/', views.fetch_interfaces, name='fetch-interfaces'),
     path('reserve-port/', reserve_port, name='reserve-port'),
+    path('port-reservations/', views.list_port_reservations, name='list-port-reservations'),
 ]
 

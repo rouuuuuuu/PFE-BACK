@@ -12,6 +12,10 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
+import sys
+import os
+
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -119,7 +123,11 @@ WSGI_APPLICATION = 'automation_project.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
-
+# settings.py
+if 'test' in sys.argv:
+    DATABASES['default']['TEST'] = {
+        'NAME': 'test_drs010_fresh',  # brand new name, no conflict
+    }
 DATABASES = {
 'default': {
 'ENGINE': 'django.db.backends.postgresql',
@@ -162,7 +170,11 @@ USE_I18N = True
 
 USE_TZ = True
 
+# L'URL publique pour accéder aux fichiers
+MEDIA_URL = '/media/'
 
+# Le dossier physique sur ton ordinateur/serveur
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 

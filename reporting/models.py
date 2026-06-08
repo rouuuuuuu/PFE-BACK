@@ -1,23 +1,23 @@
 from django.db import models
 
 class MonthlyReport(models.Model):
-    # e.g., 'April 2026'
     month_year = models.CharField(max_length=20, unique=True)
     
-    # Network Snapshot
+    # --- Network Inventory ---
     total_routers = models.IntegerField(default=0)
     total_switches = models.IntegerField(default=0)
     total_links = models.IntegerField(default=0)
     
-    # Alarm & Activity Snapshot
+    # --- NOC Activity & Automation (DRS010 Focus) ---
     critical_alarms_count = models.IntegerField(default=0)
-    provisioning_tasks_completed = models.IntegerField(default=0)
+    b2b_services_activated = models.IntegerField(default=0)  # Nouveaux clients B2B
+    backhaul_upgrades_completed = models.IntegerField(default=0) # Upgrades de liens
+    hardware_failures_recorded = models.IntegerField(default=0) # SFP/Cartes en panne
     provisioning_tasks_failed = models.IntegerField(default=0)
+    provisioning_tasks_completed = models.IntegerField(default=0) # Le champ qui manquait !
     
-    # We can store the actual generated file later
+    # --- The Actual File ---
     pdf_file = models.FileField(upload_to='reports/monthly/', null=True, blank=True)
-    
-    # Timestamps
     generated_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
