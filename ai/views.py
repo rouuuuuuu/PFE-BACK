@@ -24,7 +24,7 @@ def extract_node_name(query_text):
         return pe_pattern.group(1).upper()
         
     words = query_text.upper().split()
-    exclude = ["SLOT", "CARTE", "PANNE", "BOARD", "CARD", "SPARE", "REMPLACEMENT", "POUR", "SUR", "RESEAU", "PORTS", "OF", "ON", "POR", "DOW"]
+    exclude = ["SLOT", "CARTE", "PANNE", "BOARD", "CARD", "SPARE", "REMPLACEMENT", "POUR", "SUR", "RESEAU", "PORTS", "OF", "ON"]
     for word in words:
         clean_word = re.sub(r'[^\w-]', '', word)
         if any(char.isdigit() for char in clean_word) and clean_word not in exclude:
