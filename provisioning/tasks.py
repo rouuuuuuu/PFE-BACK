@@ -427,9 +427,8 @@ def execute_bandwidth_upgrade(self, upgrade_id):
             output = "\n".join(output_lines)
 
             # --- GENERATE THE EXACT PRODUCTION SCRIPT FOR DOWNLOAD ---
-            # This ensures your frontend generates exactly the text file you requested
             upgrade.generated_commands = (
-                
+
                 f"<{device.loopback_ip}>\n"
                 f"interface {iface_name}\n"
                 f"qos-profile {profile} outbound identifier none\n"
@@ -438,12 +437,35 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
         elif device.vendor.lower() == 'juniper':
             port = iface_name
-            junos_port = port[:-2] if port.endswith('.0') else port
-            config = f"set class-of-service interfaces {junos_port} shaping-rate {upgrade.new_bandwidth_mbps}m"
+            mbps = upgrade.new_bandwidth_mbps
+            
+            # Scale the burst size limit criteria dynamically (100M = 30400000)
+            burst_size = int(mbps) * 304000
+            
+            # Parse JunOS sub-interface elements correctly into port + unit keywords
+            if '.' in port:
+                junos_port, unit = port.split('.', 1)
+                config = f"set class-of-service interfaces {junos_port} unit {unit} shaping-rate {mbps}m"
+            else:
+                junos_port = port[:-2] if port.endswith('.0') else port
+                unit = '0'  # Fallback target parameter
+                config = f"set class-of-service interfaces {junos_port} shaping-rate {mbps}m"
+                
+            # --- LAB MODE: Execute basic shaping to keep EVE-NG candidate engine happy ---
             output = _juniper_push(
                 device.loopback_ip, device.ssh_username, device.ssh_password, config
             )
-            upgrade.generated_commands = config
+            
+            # --- GENERATE THE EXACT JUNIPER PRODUCTION SCRIPT FOR DOWNLOAD ---
+            upgrade.generated_commands = (
+
+                f"<{device.loopback_ip}>\n"
+                f"set firewall policer Bandwidth{mbps}M if-exceeding bandwidth-limit {mbps}m\n"
+                f"set firewall policer Bandwidth{mbps}M if-exceeding burst-size-limit {burst_size}\n"
+                f"set firewall policer Bandwidth{mbps}M then discard\n\n"
+                f"set interfaces {junos_port} unit {unit} family inet policer input Bandwidth{mbps}M\n"
+                f"set interfaces {junos_port} unit {unit} family inet policer output Bandwidth{mbps}M"
+            )
 
         else:
             raise ValueError(f"Unsupported vendor: {device.vendor}")

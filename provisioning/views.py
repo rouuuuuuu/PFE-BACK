@@ -148,32 +148,13 @@ def fetch_interfaces(request):
     """
     POST /api/provisioning/fetch-interfaces/
     Body: { "device_id": 5 }
-
-    SSHes into the device and runs 'display ip interface brief' (Huawei)
-    or 'show interfaces terse' (Juniper).
-
-    Called synchronously (no Celery) so the SYNC_RT button gets an
-    immediate response to populate the interface dropdown.
-
-    Returns:
-    {
-        "status": "success",
-        "vendor": "huawei",
-        "interfaces": [
-            { "name": "GigabitEthernet0/3/18", "ip": "unassigned", "physical": "up", "protocol": "down", "is_subinterface": false },
-            { "name": "GigabitEthernet0/3/18.500", "ip": "197.31.38.65/29", "physical": "up", "protocol": "up", "is_subinterface": true },
-            ...
-        ]
-    }
     """
-    # Accept both 'device_id' and 'router_id' — Angular sends router_id
     device_id = request.data.get('device_id') or request.data.get('router_id')
     if not device_id:
         return Response({'error': 'device_id or router_id is required'}, status=status.HTTP_400_BAD_REQUEST)
 
     device = get_object_or_404(Router, id=device_id)
 
-    # Call the task function directly (no .delay()) for synchronous execution
     result = fetch_device_interfaces(device.id)
 
     if result['status'] != 'success':
@@ -182,30 +163,23 @@ def fetch_interfaces(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    # Parse the raw CLI output into structured objects the Angular frontend can consume
     raw    = result['data']
     vendor = result.get('vendor', 'huawei')
 
     interfaces = _parse_interfaces(raw, vendor)
 
     return Response({
-        'status':     'success',
-        'vendor':     vendor,
-        'device_id':  device.id,
+        'status':      'success',
+        'vendor':      vendor,
+        'device_id':   device.id,
         'device_name': device.name,
-        'interfaces': interfaces,
+        'interfaces':  interfaces,
     })
 
 
 def _parse_interfaces(raw: str, vendor: str) -> list:
     """
     Parses raw CLI output into a list of interface dicts.
-
-    Huawei 'display interface description' columns:
-      Interface   PHY   Protocol   Description
-
-    Juniper 'show interfaces terse' columns:
-      Interface   Admin   Link   Proto   Local   Remote
     """
     interfaces = []
 
@@ -213,7 +187,6 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
         for line in raw.splitlines():
             stripped = line.strip()
 
-            # Skip blank lines, header, pagination prompt
             if not stripped:
                 continue
             if stripped.startswith('Interface'):
@@ -223,22 +196,19 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
             if stripped.startswith('<') or stripped.startswith('['):
                 continue
 
-            # Must start with a letter to be an interface line
             if not stripped[0].isalpha():
                 continue
 
             parts = stripped.split()
 
-            # Need at least: name + PHY + Protocol
             if len(parts) < 3:
                 continue
 
             name     = parts[0]
-            physical = parts[1]   # PHY column  e.g. 'up' / 'down'
-            protocol = parts[2]   # Protocol column
+            physical = parts[1]   
+            protocol = parts[2]   
             desc     = ' '.join(parts[3:]) if len(parts) > 3 else ''
 
-            # Skip internal/management interfaces
             if any(skip in name for skip in ('NULL', 'LoopBack', 'MEth', 'InLoopBack')):
                 continue
 
@@ -252,21 +222,36 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
 
     elif vendor == 'juniper':
         for line in raw.splitlines():
+            # 1. FIXED PROTOCOL PARSING BUG: Juniper indents inner protocol stanzas.
+            # If a line starts with explicit spaces or tabs, it is a protocol item, not an interface.
+            if line.startswith(' ') or line.startswith('\t'):
+                continue
+
             stripped = line.strip()
             if not stripped or not stripped[0].isalpha():
                 continue
 
             parts = stripped.split()
-            name  = parts[0]
+            
+            # 2. CRITICAL SAFEGUARD: If the line doesn't have at least Interface, Admin, and Link columns,
+            # it's a structural protocol label or secondary multi-IP indent. SKIP IT!
+            if len(parts) < 3:
+                continue
 
+            name = parts[0]
+
+            # 3. FIXED INTERNAL INTERFACE VISIBILITY: Strictly exclude internal processing units,
+            # management ports, and EVPN/VXLAN logical tunnels exposed natively by JunOS terse streams.
             if any(skip in name for skip in (
                 'lo0', 'fxp', 'bme', 'jsrv', 'dsc',
                 'gre', 'ipip', 'lsi', 'mtun', 'pimd', 'pime', 'tap',
+                'lc-', 'pfe-', 'pfh-', 'irb', 'mif', 'pip', 'fti', 'cbp', 'demux',
+                'em', 'esi', 'pp0', 'rbeb', 'vtep'
             )):
                 continue
 
-            physical = parts[1] if len(parts) > 1 else 'unknown'
-            protocol = parts[2] if len(parts) > 2 else 'unknown'
+            physical = parts[1]
+            protocol = parts[2]
             desc     = ' '.join(parts[5:]) if len(parts) > 5 else ''
 
             interfaces.append({
@@ -281,41 +266,104 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────
+#  GET PORT ID (DYNAMIC LOOKUP/CREATE)
+# ─────────────────────────────────────────────────────────────
+@api_view(['GET'])
+def get_port_id(request):
+    """
+    GET /api/port-id/?router_id=213&port_name=Eth1/0/3
+    """
+    router_id = request.query_params.get('router_id')
+    port_name = request.query_params.get('port_name')
+
+    if not router_id or not port_name:
+        return Response(
+            {'error': 'router_id and port_name are required'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    router = get_object_or_404(Router, id=router_id)
+
+    # Automatically find the port, or initialize it in the DB if it's a fresh live fetch
+    port, created = Port.objects.get_or_create(
+        ne_name=router.name,
+        port_full_name=port_name,
+        defaults={
+            'port_name': port_name,
+            'admin_status': 'inactive',
+            'oper_status': 'down'
+        }
+    )
+
+    return Response({
+        'port_id': port.id,
+        'message': 'Port created dynamically.' if created else 'Port found.'
+    })
+
+
+# ─────────────────────────────────────────────────────────────
 #  PORT RESERVATION — CREATE
 # ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def reserve_port(request):
     """
     POST /api/provisioning/reserve-port/
-    Body: { "router_id": 5, "port_id": 12, "description": "..." }
+    Body: { "router_id": 5, "port_id": 12, "interface_name": "ge-0/0/0.0", "description": "..." }
     """
-    router_id   = request.data.get('router_id')
-    port_id     = request.data.get('port_id')
-    description = request.data.get('description', 'Reserved via Automation')
+    router_id      = request.data.get('router_id') or request.data.get('device_id')
+    port_id        = request.data.get('port_id')
+    interface_name = request.data.get('interface_name') or request.data.get('interface')
+    description    = request.data.get('description', 'Reserved via Automation')
 
-    if not router_id or not port_id:
+    if not router_id:
         return Response(
-            {'error': 'router_id and port_id are required'},
+            {'error': 'router_id or device_id is required'},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     router = get_object_or_404(Router, id=router_id)
 
     with transaction.atomic():
-        available_port = Port.objects.select_for_update().filter(
-            id=port_id,
-            ne_name=router.name,
-            admin_status='inactive',
-            oper_status='down',
-        ).first()
+        available_port = None
+        
+        # Strategy A: Query explicitly by Primary Key ID if provided by the client parameters
+        if port_id:
+            available_port = Port.objects.select_for_update().filter(id=port_id).first()
+            
+        # Strategy B: Fallback string lookup matching the parsed string name directly under this Router
+        if not available_port and interface_name:
+            available_port = Port.objects.select_for_update().filter(
+                ne_name=router.name,
+                port_full_name=interface_name
+            ).first()
+            
+        # Strategy C: Dynamic factory generation if the entry doesn't exist inside the database schema yet
+        if not available_port and interface_name:
+            available_port = Port.objects.create(
+                ne_name=router.name,
+                port_full_name=interface_name,
+                port_name=interface_name,
+                admin_status='inactive',
+                oper_status='down',
+            )
 
         if not available_port:
             return Response(
                 {
                     'status':  'error',
-                    'message': 'Port is not available (must be inactive and down).',
+                    'message': 'Port record could not be found or dynamically initialized inside the schema.',
                 },
                 status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Allow reservation if it is inactive OR if it's already pending retry
+        if available_port.admin_status not in ('inactive', 'pending_reservation'):
+            return Response(
+                {
+                    'status':  'error',
+                    'message': f'Port {available_port.port_full_name} is already active or allocated.',
+                },
+                status=status.HTTP_409_CONFLICT,
             )
 
         available_port.admin_status = 'pending_reservation'
@@ -395,25 +443,6 @@ def retry_upgrade(request, upgrade_id):
 class StartProvisioningView(APIView):
     """
     POST /api/provisioning/start/
-    Body:
-    {
-        "device_name": "PE2",
-        "device_ip": "192.168.65.143",
-        "task_type": "internet",
-        "parameters": {
-            "port_id": 12,
-            "client_name": "HOTEL-EL-MOURADI",
-            "vlan": 500,
-            "debit_mbps": 500,
-            "vrf_name": "Internet_vpn",
-            "media_type": "fh",
-            "pe_ip_address": "197.31.38.65",
-            "subnet_type": "/29",
-            "nat_mode": "sans_nat_sans_cpe",
-            "has_switch": false,
-            ...
-        }
-    }
     """
     def post(self, request):
         serializer = ProvisioningTaskSerializer(data=request.data)
@@ -432,7 +461,6 @@ class StartProvisioningView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # ── Internet service provisioning ───────────────────────────
         if task.task_type == 'internet':
             port_id = task.parameters.get('port_id')
             if not port_id:
@@ -475,7 +503,6 @@ class StartProvisioningView(APIView):
                 status=status.HTTP_202_ACCEPTED,
             )
 
-        # ── Legacy task types ───────────────────────────────────────
         elif task.task_type in ('configure_vlan', 'firmware_upgrade', 'push_acl'):
             port = Port.objects.filter(ne_name=router.name).first()
             if not port:
@@ -536,7 +563,7 @@ class ProvisioningStatusView(APIView):
             'task_type':     task.task_type,
             'status':        task.status,
             'result':        task.result,
-            'script_output': getattr(task, 'script_output', None),  # downloadable script
+            'script_output': getattr(task, 'script_output', None),
             'created_at':    task.created_at,
             'started_at':    task.started_at,
             'completed_at':  task.completed_at,
