@@ -1,28 +1,40 @@
+from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
-from django.shortcuts import render, get_object_or_404
-from rest_framework import viewsets
+from rest_framework import status, viewsets
 from rest_framework.decorators import api_view
-from .models import Router, Switch, Port, Card, SFP, SubCard
-from .serializers import PortSerializer, CardSerializer, SFPSerializer, RouterSerializer, SwitchSerializer
+from django.shortcuts import render, get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
-from rest_framework.views import APIView
 from django.db.models import Count
-from backhaul.models import BackhaulLink
-from .serializers import UnifiedDeviceDetailSerializer
 from itertools import chain
 
+from .models import Router, Switch, Port, Card, SFP, SubCard
+from .serializers import (
+    PortSerializer, 
+    CardSerializer, 
+    SFPSerializer, 
+    RouterSerializer, 
+    SwitchSerializer,
+    UnifiedDeviceDetailSerializer
+)
+from backhaul.models import BackhaulLink
 
+
+# ─────────────────────────────────────────────────────────────
+#  UNIFIED DEVICE LIST
+# ─────────────────────────────────────────────────────────────
 class UnifiedDeviceListView(APIView):
     def get(self, request):
         routers = Router.objects.all()
         switches = Switch.objects.all()
         combined_devices = list(chain(routers, switches))
         serializer = UnifiedDeviceDetailSerializer(combined_devices, many=True)
-        return Response(serializer.data)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+# ─────────────────────────────────────────────────────────────
+#  INVENTORY VIEWSETS
+# ─────────────────────────────────────────────────────────────
 class RouterViewSet(viewsets.ModelViewSet):
     queryset = Router.objects.all()
     serializer_class = RouterSerializer
@@ -42,19 +54,28 @@ class SwitchViewSet(viewsets.ModelViewSet):
 class PortViewSet(viewsets.ModelViewSet):
     queryset = Port.objects.all()
     serializer_class = PortSerializer
-    filterset_fields = ['oper_status']
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['oper_status', 'admin_status', 'ne_name']
+    search_fields = ['port_full_name', 'port_name']
 
 
 class CardViewSet(viewsets.ModelViewSet):
     queryset = Card.objects.all()
     serializer_class = CardSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['ne_name', 'board_status']
 
 
 class SFPViewSet(viewsets.ModelViewSet):
     queryset = SFP.objects.all()
     serializer_class = SFPSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['ne_name', 'rx_status', 'tx_status']
 
 
+# ─────────────────────────────────────────────────────────────
+#  HARDWARE VERIFICATION
+# ─────────────────────────────────────────────────────────────
 class HardwareVerifyView(APIView):
     def get(self, request, device_ip):
         try:
@@ -83,7 +104,7 @@ class HardwareVerifyView(APIView):
         for p in ports:
             port_details.append({
                 "name":         p.port_full_name or p.port_name or 'Unknown',
-                "status":       p.oper_status.lower(),
+                "status":       p.oper_status.lower() if p.oper_status else 'unknown',
                 "description":  p.port_description or '',
                 "rate":         p.port_rate or 'N/A',
                 "admin_status": p.admin_status or 'N/A',
@@ -96,7 +117,7 @@ class HardwareVerifyView(APIView):
         for c in cards:
             card_details.append({
                 "name":             c.board_full_name or c.board_name or 'Unknown',
-                "status":           c.board_status.lower(),
+                "status":           c.board_status.lower() if c.board_status else 'unknown',
                 "description":      c.description or '',
                 "board_type":       c.board_type or 'N/A',
                 "slot_id":          c.slot_id or 'N/A',
@@ -109,8 +130,8 @@ class HardwareVerifyView(APIView):
         # ── SFP details ───────────────────────────────────────
         sfp_details = []
         for s in sfps:
-            rx = s.rx_status.lower()
-            tx = s.tx_status.lower()
+            rx = s.rx_status.lower() if s.rx_status else 'unknown'
+            tx = s.tx_status.lower() if s.tx_status else 'unknown'
             sfp_details.append({
                 "name":         s.port_name or 'Unknown',
                 "status":       'abnormal' if rx == 'abnormal' or tx == 'abnormal' else 'normal',
@@ -131,7 +152,7 @@ class HardwareVerifyView(APIView):
         for sc in subcards:
             subcard_details.append({
                 "name":             sc.subboard_full_name or sc.subboard_name or 'Unknown',
-                "status":           sc.subboard_status.lower(),
+                "status":           sc.subboard_status.lower() if sc.subboard_status else 'unknown',
                 "subboard_type":    sc.subboard_type or 'N/A',
                 "slot_number":      sc.slot_number or 'N/A',
                 "subslot_number":   sc.subslot_number or 'N/A',
@@ -164,10 +185,13 @@ class HardwareVerifyView(APIView):
             "subcard_details": subcard_details,
         }, status=status.HTTP_200_OK)
 
+
+# ─────────────────────────────────────────────────────────────
+#  DASHBOARD METRICS & STATS
+# ─────────────────────────────────────────────────────────────
 class DashboardStatsView(APIView):
     def get(self, request):
         
-        # --- NEW: Helper Function for Hardware Breakdowns ---
         def get_top_breakdown(model, field_name, limit=4):
             """
             Groups by field_name, counts occurrences, sorts by highest count.
@@ -193,7 +217,7 @@ class DashboardStatsView(APIView):
                 
             return breakdown
 
-        # --- EXISTING: Basic Counts ---
+        # Base Queries
         total_routers  = Router.objects.count()
         total_switches = Switch.objects.count()
 
@@ -229,7 +253,7 @@ class DashboardStatsView(APIView):
         subcards_normal   = SubCard.objects.filter(subboard_status='normal').count()
         subcards_abnormal = SubCard.objects.filter(subboard_status='abnormal').count()
 
-        # --- NEW: Generate Breakdowns ---
+        # Compute Categorized Breakdowns
         hardware_breakdowns = {
             "ports": {
                 "by_rate": get_top_breakdown(Port, 'port_rate', limit=4)
@@ -245,7 +269,6 @@ class DashboardStatsView(APIView):
             }
         }
 
-        # --- COMBINED RESPONSE ---
         return Response({
             "devices": {
                 "routers":           total_routers,
@@ -280,14 +303,42 @@ class DashboardStatsView(APIView):
                     "abnormal": subcards_abnormal,
                 },
             },
-            # Add the new breakdowns object here!
             "hardware_breakdowns": hardware_breakdowns
-            
         }, status=status.HTTP_200_OK)
+
+
+# ─────────────────────────────────────────────────────────────
+#  GET PORT ID (DYNAMIC LOOKUP/FACTORY ENGINE)
+# ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def get_port_id(request):
+    """
+    GET /api/port-id/?router_id=212&port_name=Ethernet1/0/5
+    """
     router_id = request.query_params.get('router_id')
     port_name = request.query_params.get('port_name')
+
+    if not router_id or not port_name:
+        return Response(
+            {'error': 'router_id and port_name query parameters are required.'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Resolve Router instance
     router = get_object_or_404(Router, id=router_id)
-    port   = get_object_or_404(Port, ne_name=router.name, port_full_name=port_name)
-    return Response({'port_id': port.id})
+
+    # DYNAMIC LOGIC: Fetches port row or creates it seamlessly if it doesn't exist
+    port, created = Port.objects.get_or_create(
+        ne_name=router.name,
+        port_full_name=port_name,
+        defaults={
+            'port_name': port_name,
+            'admin_status': 'inactive',
+            'oper_status': 'down'
+        }
+    )
+
+    return Response({
+        'port_id': port.id,
+        'message': 'Port created dynamically.' if created else 'Port found.'
+    }, status=status.HTTP_200_OK)

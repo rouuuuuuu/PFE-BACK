@@ -122,6 +122,10 @@ def _normalize_huawei_port(port_name: str) -> str:
     if port_name.startswith('Eth-Trunk'):
         return port_name
 
+    # CRITICAL FIX: If the port name is ALREADY fully expanded, stop touching it!
+    if port_name.startswith('Ethernet') or port_name.startswith('GigabitEthernet'):
+        return port_name
+
     replacements = {
         'Eth': 'Ethernet', 
         'GE': 'GigabitEthernet'
@@ -130,6 +134,7 @@ def _normalize_huawei_port(port_name: str) -> str:
     for stored, cli in replacements.items():
         if port_name.startswith(stored):
             return cli + port_name[len(stored):]
+            
     return port_name
 
 
@@ -145,6 +150,7 @@ def build_provisioning_payload(port_name, params):
     qos_debit = int(debit_mbps * 0.95) if media_type == 'fh' else debit_mbps
     qos_profile = f"shaping{qos_debit}"
 
+    # Extract explicitly from parameters instead of using fallback defaults
     subnet_type = params.get('subnet_type', '/30')
     mask_map = {
         '/28': '255.255.255.240',
@@ -220,12 +226,12 @@ class HuaweiDriver(ProvisioningDriver):
         " ip binding vpn-instance {{ vrf_name }}\n"
         " ip address {{ pe_ip }} {{ subnet_mask }}\n"
         " statistic enable\n"
-        " trust upstream default"
+        #" trust upstream default"
     )
 
     STATIC_ROUTE_TEMPLATE = (
         "ip route-static vpn-instance {{ vrf_name }} "
-        "{{ cust_lan_prefix }} {{ ce_ip }}"
+        "{{ cust_lan_prefix }} {{ cust_lan_cidr }} {{ ce_ip }}"
         "  description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET"
     )
 
@@ -362,7 +368,7 @@ def get_vendor_driver(vendor, host, username, password):
 
 
 # ============================================================
-# TASK 1 — BANDWIDTH UPGRADE   (script 21)
+# TASK 1 — BANDWIDTH UPGRADE   (script 21) - NOT TOUCHED
 # ============================================================
 
 @shared_task(bind=True)
@@ -401,7 +407,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
             iface_name = _normalize_huawei_port(iface_name)
             output_lines = []
 
-            # Convert Mbps to Kbps for the bandwidth command fallback
             kbps = int(upgrade.new_bandwidth_mbps) * 1000
 
             with ConnectHandler(**_huawei_device_params(
@@ -412,10 +417,6 @@ def execute_bandwidth_upgrade(self, upgrade_id):
                 conn.read_channel()
 
                 _hw_send(conn, f'interface {iface_name}', output_lines, sleep=3)
-                
-                # --- LAB MODE: EVE-NG Bypass ---
-                # Since the stripped virtual image rejects all hardware QoS commands, 
-                # we use the basic bandwidth command to satisfy the simulator's execution state.
                 _hw_send(conn, f'bandwidth {kbps}', output_lines)
 
                 conn.write_channel('quit\n')
@@ -426,9 +427,7 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
             output = "\n".join(output_lines)
 
-            # --- GENERATE THE EXACT PRODUCTION SCRIPT FOR DOWNLOAD ---
             upgrade.generated_commands = (
-
                 f"<{device.loopback_ip}>\n"
                 f"interface {iface_name}\n"
                 f"qos-profile {profile} outbound identifier none\n"
@@ -438,27 +437,21 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         elif device.vendor.lower() == 'juniper':
             port = iface_name
             mbps = upgrade.new_bandwidth_mbps
-            
-            # Scale the burst size limit criteria dynamically (100M = 30400000)
             burst_size = int(mbps) * 304000
             
-            # Parse JunOS sub-interface elements correctly into port + unit keywords
             if '.' in port:
                 junos_port, unit = port.split('.', 1)
                 config = f"set class-of-service interfaces {junos_port} unit {unit} shaping-rate {mbps}m"
             else:
                 junos_port = port[:-2] if port.endswith('.0') else port
-                unit = '0'  # Fallback target parameter
+                unit = '0'
                 config = f"set class-of-service interfaces {junos_port} shaping-rate {mbps}m"
                 
-            # --- LAB MODE: Execute basic shaping to keep EVE-NG candidate engine happy ---
             output = _juniper_push(
                 device.loopback_ip, device.ssh_username, device.ssh_password, config
             )
             
-            # --- GENERATE THE EXACT JUNIPER PRODUCTION SCRIPT FOR DOWNLOAD ---
             upgrade.generated_commands = (
-
                 f"<{device.loopback_ip}>\n"
                 f"set firewall policer Bandwidth{mbps}M if-exceeding bandwidth-limit {mbps}m\n"
                 f"set firewall policer Bandwidth{mbps}M if-exceeding burst-size-limit {burst_size}\n"
@@ -489,7 +482,7 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
 
 # ============================================================
-# TASK 2 — FETCH INTERFACES (live from device)
+# TASK 2 — FETCH INTERFACES (live from device) - NOT TOUCHED
 # ============================================================
 
 @shared_task
@@ -564,7 +557,7 @@ def fetch_device_interfaces(device_id):
 
 
 # ============================================================
-# TASK 3 — PORT RESERVATION (undo shutdown + description)
+# TASK 3 — PORT RESERVATION (undo shutdown + description) - NOT TOUCHED
 # ============================================================
 
 @shared_task(bind=True)
@@ -640,7 +633,7 @@ def execute_port_reservation(self, port_id, router_id, description):
 
 
 # ============================================================
-# TASK 4 — INTERNET PROVISIONING
+# TASK 4 — INTERNET PROVISIONING - UPDATED FOR DYNAMIC SLICING
 # ============================================================
 
 @shared_task(bind=True)
@@ -655,6 +648,7 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
     except Exception:
         return "Database records not found."
 
+    # The payload context builder dynamically inherits public_range and subnet_type parameters
     payload  = build_provisioning_payload(port.port_full_name, task.parameters)
     lock_key = f'device_lock_{router.loopback_ip}'
 

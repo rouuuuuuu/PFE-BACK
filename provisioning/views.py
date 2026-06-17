@@ -223,7 +223,6 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
     elif vendor == 'juniper':
         for line in raw.splitlines():
             # 1. FIXED PROTOCOL PARSING BUG: Juniper indents inner protocol stanzas.
-            # If a line starts with explicit spaces or tabs, it is a protocol item, not an interface.
             if line.startswith(' ') or line.startswith('\t'):
                 continue
 
@@ -233,15 +232,13 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
 
             parts = stripped.split()
             
-            # 2. CRITICAL SAFEGUARD: If the line doesn't have at least Interface, Admin, and Link columns,
-            # it's a structural protocol label or secondary multi-IP indent. SKIP IT!
+            # 2. CRITICAL SAFEGUARD: Prevent IndexError on unformatted protocol lines
             if len(parts) < 3:
                 continue
 
             name = parts[0]
 
-            # 3. FIXED INTERNAL INTERFACE VISIBILITY: Strictly exclude internal processing units,
-            # management ports, and EVPN/VXLAN logical tunnels exposed natively by JunOS terse streams.
+            # 3. FIXED INTERNAL INTERFACE VISIBILITY: Exclude JunOS infrastructure ports
             if any(skip in name for skip in (
                 'lo0', 'fxp', 'bme', 'jsrv', 'dsc',
                 'gre', 'ipip', 'lsi', 'mtun', 'pimd', 'pime', 'tap',
@@ -449,17 +446,20 @@ class StartProvisioningView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        task = serializer.save()
+        # 1. Extract the device name from the validated payload
+        device_name = serializer.validated_data.get('device_name')
 
+       # 2. Fetch the router object FIRST (Case-Insensitive)
         try:
-            router = Router.objects.get(name=task.device_name)
+            router = Router.objects.get(name__iexact=device_name)
         except Router.DoesNotExist:
-            task.status = 'failed'
-            task.save()
             return Response(
-                {'error': f'Device "{task.device_name}" not found in database.'},
+                {'error': f'Device "{device_name}" not found in database.'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # 3. Save the task while simultaneously injecting the automatic IP
+        task = serializer.save(device_ip=router.loopback_ip)
 
         if task.task_type == 'internet':
             port_id = task.parameters.get('port_id')
