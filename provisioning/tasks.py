@@ -31,10 +31,7 @@ def _huawei_device_params(host, username, password):
 
 
 def _hw_send(conn, cmd, output_lines, sleep=2, check_error=True):
-    """
-    Send one command over an open Netmiko channel, wait, read back.
-    Raises RuntimeError immediately if the device returns an error line.
-    """
+    """Write one command, wait, read back. Raises on VRP Error lines."""
     conn.write_channel(cmd + '\n')
     time.sleep(sleep)
     out = conn.read_channel()
@@ -45,11 +42,7 @@ def _hw_send(conn, cmd, output_lines, sleep=2, check_error=True):
 
 
 def _hw_commit_save(conn, output_lines):
-    """
-    Standard Huawei exit sequence used by every task:
-    quit → commit → return → save → y
-    Always called from inside system-view (after a quit from interface view).
-    """
+    """commit → return → save → y  (always called from system-view)"""
     conn.write_channel('commit\n')
     time.sleep(6)
     out = conn.read_channel()
@@ -71,10 +64,7 @@ def _hw_commit_save(conn, output_lines):
 
 
 def _juniper_push(host, username, password, config_string, max_attempts=5):
-    """
-    Push a set-format config string to a Juniper device via NETCONF/PyEZ.
-    Retries up to max_attempts times with 15 s gaps to handle slow EVE-NG boots.
-    """
+    """Push set-format config to Juniper via NETCONF. Retries for slow EVE-NG boots."""
     from jnpr.junos.utils.config import Config
     from napalm.base.exceptions import ConnectionException
 
@@ -93,64 +83,101 @@ def _juniper_push(host, username, password, config_string, max_attempts=5):
                 cu.load(config_string, format='set', ignore_warning=True)
                 cu.commit()
             return f"Committed to {host}:\n{config_string}"
-
         except ConnectionException as e:
             last_exc = e
-            logger.warning(
-                f"NETCONF not ready on {host} (attempt {attempt}/{max_attempts})"
-                f" — retrying in 15s"
-            )
+            logger.warning(f"NETCONF not ready on {host} (attempt {attempt}/{max_attempts}) — retrying in 15s")
             time.sleep(15)
 
-    raise ConnectionException(
-        f"Could not connect to {host} after {max_attempts} attempts: {last_exc}"
-    )
+    raise ConnectionException(f"Could not connect to {host} after {max_attempts} attempts: {last_exc}")
 
 
 # ============================================================
-# BUSINESS LOGIC — port normalisation + payload builder
+# SWITCH TOPOLOGY LOOKUP
 # ============================================================
+
+def find_switch_for_port(router, port_name):
+    """
+    Returns the Switch object attached to this router port, or None.
+    Queries: Switch where router_port == port_name AND routeur contains router.name
+    """
+    try:
+        from devices.models import Switch
+        router_fragment = router.name.split('_')[1] if '_' in router.name else router.name
+        sw = Switch.objects.filter(
+            interface_rt=port_name,
+            connected_router__name__icontains=router_fragment
+        ).first()
+        if sw:
+            return sw
+
+        sw = Switch.objects.filter(
+            interface_rt=port_name,
+            connected_router__loopback_ip=router.loopback_ip
+        ).first()
+        return sw
+    except Exception as e:
+        logger.warning(f"Switch lookup failed for {router.name}/{port_name}: {e}")
+        return None
+
+
+# ============================================================
+# BUSINESS LOGIC — PE IP auto-derivation + payload builder
+# ============================================================
+
+def _get_pe_ip_from_range(public_range: str, subnet_type: str) -> str:
+    """
+    Auto-derives the PE IP from the selected public range and subnet type.
+    Returns the first usable host of the first subnet of the given prefix.
+
+    Examples:
+      '196.203.0.0/24' + '/30' → '196.203.0.1'
+      '196.203.0.0/24' + '/29' → '196.203.0.1'
+      '196.203.0.0/24' + '/31' → '196.203.0.0'
+    """
+    import ipaddress
+    try:
+        network    = ipaddress.ip_network(public_range, strict=False)
+        prefix_len = int(subnet_type.replace('/', ''))
+        subnets    = list(network.subnets(new_prefix=prefix_len))
+        if not subnets:
+            return ''
+        first_subnet = subnets[0]
+        hosts = list(first_subnet.hosts())
+        # /31 has no hosts() in Python — use network addresses directly
+        if not hosts:
+            hosts = list(first_subnet)
+        return str(hosts[0]) if hosts else ''
+    except Exception as e:
+        logger.warning(f"PE IP derivation failed for {public_range} + {subnet_type}: {e}")
+        return ''
+
 
 def _normalize_huawei_port(port_name: str) -> str:
-    """
-    The DB may store long-form names that differ from what VRP shows.
-    Only fix genuine mismatches; never touch Eth-Trunk names.
-    """
     if not port_name:
         return port_name
-        
-    if port_name.startswith('Eth-Trunk'):
-        return port_name
-
-    # CRITICAL FIX: If the port name is ALREADY fully expanded, stop touching it!
-    if port_name.startswith('Ethernet') or port_name.startswith('GigabitEthernet'):
+    if port_name.startswith('Eth-Trunk') or port_name.startswith('Ethernet') or port_name.startswith('GigabitEthernet'):
         return port_name
 
     replacements = {
-        'Eth': 'Ethernet', 
+        'Eth': 'Ethernet',
         'GE': 'GigabitEthernet'
     }
-
     for stored, cli in replacements.items():
         if port_name.startswith(stored):
             return cli + port_name[len(stored):]
-            
     return port_name
 
 
-def build_provisioning_payload(port_name, params):
-    """
-    Builds the Jinja context dict from ProvisioningTask.parameters.
-    """
+def build_provisioning_payload(port_name, params, router=None):
+    """Builds the Jinja context dict from ProvisioningTask.parameters."""
     port_name = _normalize_huawei_port(port_name)
 
     media_type = params.get('media_type', 'fo').lower()
     debit_mbps = int(params.get('debit_mbps', 0))
 
-    qos_debit = int(debit_mbps * 0.95) if media_type == 'fh' else debit_mbps
+    qos_debit   = int(debit_mbps * 0.95) if media_type == 'fh' else debit_mbps
     qos_profile = f"shaping{qos_debit}"
 
-    # Extract explicitly from parameters instead of using fallback defaults
     subnet_type = params.get('subnet_type', '/30')
     mask_map = {
         '/28': '255.255.255.240',
@@ -159,33 +186,48 @@ def build_provisioning_payload(port_name, params):
         '/31': '255.255.255.254',
     }
 
+    has_switch   = params.get('has_switch', False)
+    switch_ip    = params.get('switch_ip')
+    switch_uplink = params.get('switch_uplink_port', 'ge-0/1/0')
+    switch_port  = params.get('switch_port')
+    switch_vendor = params.get('switch_vendor', 'juniper')
+
+    if has_switch and not switch_ip and router:
+        sw = find_switch_for_port(router, port_name)
+        if sw:
+            switch_ip     = sw.loopback_ip
+            switch_uplink = getattr(sw, 'interface_sw', 'ge-0/1/0')
+            switch_port   = getattr(sw, 'interface_sw', '')
+            switch_vendor = 'cisco' if 'cisco' in getattr(sw, 'model', '').lower() else 'juniper'
+
+    # ── PE IP: auto-derive from public_range + subnet_type if not provided ──
+    # The user selects the public range and subnet size — PE IP is computed
+    # automatically as the first usable host of the first subnet in that range.
+    pe_ip = params.get('pe_ip_address') or params.get('pe_ip') or ''
+    if not pe_ip and params.get('public_range') and subnet_type:
+        pe_ip = _get_pe_ip_from_range(params['public_range'], subnet_type)
+
     return {
         'client_name':        params.get('client_name', 'Unknown'),
-        'port_name':          port_name,            
+        'port_name':          port_name,
         'vlan':               params.get('vlan'),
-        'media_type':         media_type.upper(),   
-
-        'pe_ip':              params.get('pe_ip_address'),
+        'media_type':         media_type.upper(),
+        'pe_ip':              pe_ip,
         'subnet_cidr':        subnet_type,
         'subnet_mask':        mask_map.get(subnet_type, '255.255.255.252'),
-
-        'vrf_name':           params.get('vrf_name', 'Internet_vpn'),
-
-        'qos_profile':        qos_profile,          
-        'qos_mbps':           qos_debit,            
-
+        'vrf_name':           'Internet_vpn',
+        'qos_profile':        qos_profile,
+        'qos_mbps':           qos_debit,
         'nat_mode':           params.get('nat_mode'),
-        'ce_ip':              params.get('ce_ip_address'),
+        'ce_ip':              params.get('ce_ip_address') or params.get('ce_ip') or '',
         'cust_lan_prefix':    params.get('customer_lan_prefix', ''),
         'cust_lan_cidr':      params.get('customer_lan_cidr', ''),
-
-        'has_switch':         params.get('has_switch', False),
-        'switch_ip':          params.get('switch_ip'),
-        'switch_port':        params.get('switch_port'),
-        'switch_uplink_port': params.get('switch_uplink_port', 'ge-0/1/0'),
-        'public_range':       params.get('public_range'),
-
-        'is_bundle':          (
+        'has_switch':         has_switch,
+        'switch_ip':          switch_ip,
+        'switch_port':        switch_port,
+        'switch_uplink_port': switch_uplink,
+        'switch_vendor':      switch_vendor,
+        'is_bundle': (
             port_name.startswith('Eth-Trunk')
             or port_name.lower().startswith('ae')
         ),
@@ -198,7 +240,7 @@ def build_provisioning_payload(port_name, params):
 
 class ProvisioningDriver(ABC):
     def __init__(self, host, username, password):
-        self.host = host
+        self.host     = host
         self.username = username
         self.password = password
 
@@ -208,6 +250,10 @@ class ProvisioningDriver(ABC):
 
     @abstractmethod
     def execute(self, config_data) -> str:
+        pass
+
+    @abstractmethod
+    def render_script(self, payload, router_ip='') -> str:
         pass
 
 
@@ -225,22 +271,37 @@ class HuaweiDriver(ProvisioningDriver):
         " description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET\n"
         " ip binding vpn-instance {{ vrf_name }}\n"
         " ip address {{ pe_ip }} {{ subnet_mask }}\n"
-        " statistic enable\n"
-        #" trust upstream default"
+        " qos-profile {{ qos_profile }} outbound identifier none\n"
+        " qos-profile {{ qos_profile }} inbound identifier none\n"
+        " statistic enable \n"
+        " trust upstream default"
     )
 
     STATIC_ROUTE_TEMPLATE = (
         "ip route-static vpn-instance {{ vrf_name }} "
-        "{{ cust_lan_prefix }} {{ cust_lan_cidr }} {{ ce_ip }}"
+        "{{ cust_lan_prefix }} {{ subnet_mask }} {{ ce_ip }}"
         "  description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET"
     )
 
-    def generate_config(self, payload) -> dict:
-        physical_lines = []
-        if not payload.get('has_switch'):
-            physical_lines = Template(self.PHYS_TEMPLATE).render(payload).splitlines()
+    # Lab-safe: no qos-profile, no trust upstream default (image rejects them)
+    LAB_SUB_TEMPLATE = (
+        "interface {{ port_name }}.{{ vlan }}\n"
+        "vlan-type dot1q {{ vlan }}\n"
+        "description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET\n"
+        "ip binding vpn-instance {{ vrf_name }}\n"
+        "ip address {{ pe_ip }} {{ subnet_mask }}\n"
+        "statistic enable"
+    )
 
-        sub_lines = Template(self.SUB_TEMPLATE).render(payload).splitlines()
+    def generate_config(self, payload) -> dict:
+        has_switch = payload.get('has_switch', False)
+
+        phys_lines = []
+        if not has_switch:
+            phys_lines = Template(self.PHYS_TEMPLATE).render(payload).splitlines()
+
+        prod_sub_lines = Template(self.SUB_TEMPLATE).render(payload).splitlines()
+        lab_sub_lines  = Template(self.LAB_SUB_TEMPLATE).render(payload).splitlines()
 
         static_route = None
         if (
@@ -251,8 +312,9 @@ class HuaweiDriver(ProvisioningDriver):
             static_route = Template(self.STATIC_ROUTE_TEMPLATE).render(payload)
 
         return {
-            'physical_lines': physical_lines,
-            'sub_lines':      sub_lines,
+            'phys_lines':     phys_lines,
+            'prod_sub_lines': prod_sub_lines,
+            'lab_sub_lines':  lab_sub_lines,
             'static_route':   static_route,
         }
 
@@ -267,16 +329,22 @@ class HuaweiDriver(ProvisioningDriver):
             time.sleep(3)
             conn.read_channel()
 
-            if config_data['physical_lines']:
-                _hw_send(conn, config_data['physical_lines'][0], output_lines, sleep=3)
-                for cmd in config_data['physical_lines'][1:]:
+            # Physical interface block (scripts 22/23 only, not 25)
+            if config_data['phys_lines']:
+                # Strip leading spaces — VRP rejects indented commands via raw channel
+                phys_cmds = [l.strip() for l in config_data['phys_lines'] if l.strip()]
+                _hw_send(conn, phys_cmds[0], output_lines, sleep=3)
+                for cmd in phys_cmds[1:]:
                     _hw_send(conn, cmd, output_lines)
                 conn.write_channel('quit\n')
                 time.sleep(2)
                 conn.read_channel()
 
-            _hw_send(conn, config_data['sub_lines'][0], output_lines, sleep=3)
-            for cmd in config_data['sub_lines'][1:]:
+            # Sub-interface block — lab-safe, no qos-profile
+            # LAB_SUB_TEMPLATE has no leading spaces so strip() is safe
+            lab_cmds = [l.strip() for l in config_data['lab_sub_lines'] if l.strip()]
+            _hw_send(conn, lab_cmds[0], output_lines, sleep=3)
+            for cmd in lab_cmds[1:]:
                 _hw_send(conn, cmd, output_lines)
 
             conn.write_channel('quit\n')
@@ -284,37 +352,84 @@ class HuaweiDriver(ProvisioningDriver):
             conn.read_channel()
 
             if config_data['static_route']:
-                _hw_send(conn, config_data['static_route'], output_lines)
+                _hw_send(conn, config_data['static_route'].strip(), output_lines)
 
             _hw_commit_save(conn, output_lines)
 
         return "\n".join(output_lines)
 
-    def render_script(self, payload) -> str:
-        cfg = self.generate_config(payload)
-        parts = []
+    def render_script(self, payload, router_ip='') -> str:
+        mode_labels = {
+            'sans_nat_sans_cpe': 'port dédié sur RT Huawei Sans NAT sans CPE',
+            'sans_nat_avec_cpe': 'port dédié sur RT Huawei Sans NAT avec CPE',
+            'avec_nat':          'port dédié sur RT Huawei Avec NAT',
+        }
+        label = mode_labels.get(payload.get('nat_mode', ''), 'provisioning B2B Internet')
 
-        if cfg['physical_lines']:
-            parts.append('\n'.join(cfg['physical_lines']))
+        cfg   = self.generate_config(payload)
+        parts = [
+            f"==> {label}",
+            "",
+            f"<{router_ip}>",
+            "",
+        ]
+
+        if cfg['phys_lines']:
+            parts.append('\n'.join(cfg['phys_lines']))
             parts.append('')
 
-        parts.append('\n'.join(cfg['sub_lines']))
+        parts.append('\n'.join(cfg['prod_sub_lines']))
 
         if cfg['static_route']:
-            parts.append('')
             parts.append(cfg['static_route'])
 
         return '\n'.join(parts)
 
 
-class JuniperSwitchDriver(ProvisioningDriver):
+class CiscoSwitchDriver(ProvisioningDriver):
+    """Driver L2/VLAN pour switchs Cisco IOS."""
+    TEMPLATE = (
+        "vlan {{ vlan }}\n"
+        " name Internet_{{ client_name }}\n"
+        "exit\n"
+        "interface {{ switch_port }}\n"
+        " switchport mode trunk\n"
+        " switchport trunk allowed vlan add {{ vlan }}\n"
+        " description {{ client_name }}_{{ media_type }}_Internet\n"
+        "exit\n"
+        "interface {{ switch_uplink_port }}\n"
+        " switchport mode trunk\n"
+        " switchport trunk allowed vlan add {{ vlan }}"
+    )
 
+    def generate_config(self, payload) -> str:
+        return Template(self.TEMPLATE).render(payload)
+
+    def execute(self, config_string) -> str:
+        output_lines = []
+        with ConnectHandler(
+            device_type='cisco_ios',
+            host=self.host,
+            username=self.username,
+            password=self.password
+        ) as conn:
+            conn.enable()
+            output = conn.send_config_set(config_string.splitlines())
+            output_lines.append(output)
+            conn.send_command('write memory')
+        return "\n".join(output_lines)
+
+    def render_script(self, payload, router_ip='') -> str:
+        return self.generate_config(payload)
+
+
+class JuniperSwitchDriver(ProvisioningDriver):
     TEMPLATE = (
         "set vlans v{{ vlan }}_Internet_{{ client_name }} vlan-id {{ vlan }}\n"
-        "set interfaces {{ switch_port }} description {{ client_name }}_{{ media_type }}_Internet\n"
-        "set interfaces {{ switch_port }} unit 0 family ethernet-switching interface-mode trunk\n"
-        "set interfaces {{ switch_port }} unit 0 family ethernet-switching vlan members v{{ vlan }}_Internet_{{ client_name }}\n"
-        "set interfaces {{ switch_uplink_port }} unit 0 family ethernet-switching vlan members v{{ vlan }}_Internet_{{ client_name }}"
+        "set interfaces {{ switch_port }}  description {{ client_name }}_{{ media_type }}_Internet\n"
+        "set interfaces {{ switch_port }}  unit 0 family ethernet-switching interface-mode trunk\n"
+        "set interfaces {{ switch_port }}  unit 0 family ethernet-switching vlan members v{{ vlan }}_Internet_{{ client_name }}\n"
+        "set interfaces {{ switch_uplink_port }} unit 0 family ethernet-switching vlan members  v{{ vlan }}_Internet_{{ client_name }}"
     )
 
     def generate_config(self, payload) -> str:
@@ -323,12 +438,11 @@ class JuniperSwitchDriver(ProvisioningDriver):
     def execute(self, config_string) -> str:
         return _juniper_push(self.host, self.username, self.password, config_string)
 
-    def render_script(self, payload) -> str:
+    def render_script(self, payload, router_ip='') -> str:
         return self.generate_config(payload)
 
 
 class JuniperDriver(ProvisioningDriver):
-
     TEMPLATE = (
         "delete interfaces {{ junos_port }} unit 0\n"
         "set interfaces {{ junos_port }} vlan-tagging\n"
@@ -345,22 +459,19 @@ class JuniperDriver(ProvisioningDriver):
     )
 
     def generate_config(self, payload) -> str:
-        port_name = payload['port_name']
+        port_name  = payload['port_name']
         junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
         return Template(self.TEMPLATE).render({**payload, 'junos_port': junos_port})
 
     def execute(self, config_string) -> str:
         return _juniper_push(self.host, self.username, self.password, config_string)
 
-    def render_script(self, payload) -> str:
+    def render_script(self, payload, router_ip='') -> str:
         return self.generate_config(payload)
 
 
 def get_vendor_driver(vendor, host, username, password):
-    drivers = {
-        'huawei':  HuaweiDriver,
-        'juniper': JuniperDriver,
-    }
+    drivers = {'huawei': HuaweiDriver, 'juniper': JuniperDriver, 'cisco': CiscoSwitchDriver}
     cls = drivers.get(vendor.lower())
     if not cls:
         raise ValueError(f"Unsupported vendor: {vendor}")
@@ -368,22 +479,18 @@ def get_vendor_driver(vendor, host, username, password):
 
 
 # ============================================================
-# TASK 1 — BANDWIDTH UPGRADE   (script 21) - NOT TOUCHED
+# TASK 1 — BANDWIDTH UPGRADE
 # ============================================================
 
 @shared_task(bind=True)
 def execute_bandwidth_upgrade(self, upgrade_id):
-    """
-    Updates the QoS profile on an existing sub-interface.
-    The profile name is derived from new_bandwidth_mbps: shaping<N>.
-    """
     try:
         upgrade = BandwidthUpgrade.objects.get(upgrade_id=upgrade_id)
     except BandwidthUpgrade.DoesNotExist:
         return "Upgrade record not found."
 
-    device = upgrade.device
-    lock_key = f'device_lock_{device.loopback_ip}'
+    device    = upgrade.device
+    lock_key  = f'device_lock_{device.loopback_ip}'
     lock_acquired = redis_client.set(lock_key, str(upgrade_id), nx=True, ex=600)
 
     if not lock_acquired:
@@ -397,16 +504,15 @@ def execute_bandwidth_upgrade(self, upgrade_id):
         upgrade.started_at = timezone.now()
         upgrade.save()
 
-        profile = f"shaping{upgrade.new_bandwidth_mbps}"
-
+        profile    = f"shaping{upgrade.new_bandwidth_mbps}"
         iface_name = upgrade.interface
+
         if upgrade.vlan and '.' not in iface_name:
             iface_name = f"{iface_name}.{upgrade.vlan}"
+        iface_name = _normalize_huawei_port(iface_name)
 
         if device.vendor.lower() == 'huawei':
-            iface_name = _normalize_huawei_port(iface_name)
             output_lines = []
-
             kbps = int(upgrade.new_bandwidth_mbps) * 1000
 
             with ConnectHandler(**_huawei_device_params(
@@ -426,31 +532,24 @@ def execute_bandwidth_upgrade(self, upgrade_id):
                 _hw_commit_save(conn, output_lines)
 
             output = "\n".join(output_lines)
-
             upgrade.generated_commands = (
                 f"<{device.loopback_ip}>\n"
                 f"interface {iface_name}\n"
-                f"qos-profile {profile} outbound identifier none\n"
-                f"qos-profile {profile} inbound identifier none"
+                f" qos-profile {profile} outbound identifier none\n"
+                f" qos-profile {profile} inbound identifier none"
             )
 
         elif device.vendor.lower() == 'juniper':
-            port = iface_name
             mbps = upgrade.new_bandwidth_mbps
-            burst_size = int(mbps) * 304000
-            
-            if '.' in port:
-                junos_port, unit = port.split('.', 1)
-                config = f"set class-of-service interfaces {junos_port} unit {unit} shaping-rate {mbps}m"
+            if '.' in iface_name:
+                junos_port, unit = iface_name.split('.', 1)
             else:
-                junos_port = port[:-2] if port.endswith('.0') else port
+                junos_port = iface_name[:-2] if iface_name.endswith('.0') else iface_name
                 unit = '0'
-                config = f"set class-of-service interfaces {junos_port} shaping-rate {mbps}m"
-                
-            output = _juniper_push(
-                device.loopback_ip, device.ssh_username, device.ssh_password, config
-            )
-            
+
+            burst_size = int(mbps) * 304000
+            config = f"set class-of-service interfaces {junos_port} unit {unit} shaping-rate {mbps}m"
+            output = _juniper_push(device.loopback_ip, device.ssh_username, device.ssh_password, config)
             upgrade.generated_commands = (
                 f"<{device.loopback_ip}>\n"
                 f"set firewall policer Bandwidth{mbps}M if-exceeding bandwidth-limit {mbps}m\n"
@@ -482,21 +581,16 @@ def execute_bandwidth_upgrade(self, upgrade_id):
 
 
 # ============================================================
-# TASK 2 — FETCH INTERFACES (live from device) - NOT TOUCHED
+# TASK 2 — FETCH INTERFACES
 # ============================================================
 
 @shared_task
 def fetch_device_interfaces(device_id):
-    """
-    SSH into the device and run 'display interface description' or 'show interfaces terse'.
-    Strictly filters infrastructure, looping systems, and dedicated backhaul management instances.
-    """
     from devices.models import Router
     try:
         device = Router.objects.get(id=device_id)
-
-        ignored_patterns = re.compile(
-            r'(^loop|^null|^meth|^fxp|^vme|vlanif4094|\.4094|\bloopback\b)', 
+        ignored = re.compile(
+            r'(^loop|^null|^meth|^fxp|^vme|vlanif4094|\.4094|\bloopback\b)',
             re.IGNORECASE
         )
 
@@ -505,21 +599,16 @@ def fetch_device_interfaces(device_id):
                 device.loopback_ip, device.ssh_username, device.ssh_password
             )) as conn:
                 conn.send_command_timing('screen-length 0 temporary', delay_factor=2)
-                raw_output = conn.send_command(
-                    'display interface description',
-                    read_timeout=30,
-                )
-            
-            filtered_lines = []
-            for line in raw_output.splitlines():
-                clean_line = line.strip()
-                if not clean_line or clean_line.startswith('Interface') or clean_line.startswith('PHY'):
-                    continue
-                if ignored_patterns.search(clean_line):
-                    continue
-                filtered_lines.append(line)
-                
-            return {'status': 'success', 'data': '\n'.join(filtered_lines), 'vendor': 'huawei'}
+                raw = conn.send_command('display interface description', read_timeout=30)
+
+            filtered = [
+                line for line in raw.splitlines()
+                if line.strip()
+                and not line.strip().startswith('Interface')
+                and not line.strip().startswith('PHY')
+                and not ignored.search(line.strip())
+            ]
+            return {'status': 'success', 'data': '\n'.join(filtered), 'vendor': 'huawei'}
 
         elif device.vendor.lower() == 'juniper':
             driver = get_network_driver('junos')
@@ -532,22 +621,12 @@ def fetch_device_interfaces(device_id):
             dev.open()
             result = dev.cli(['show interfaces terse'])
             dev.close()
-            
-            raw_output = result.get('show interfaces terse', '')
-            filtered_lines = []
-            for line in raw_output.splitlines():
-                clean_line = line.strip()
-                if not clean_line:
-                    continue
-                if ignored_patterns.search(clean_line):
-                    continue
-                filtered_lines.append(line)
-
-            return {
-                'status': 'success',
-                'data': '\n'.join(filtered_lines),
-                'vendor': 'juniper',
-            }
+            raw = result.get('show interfaces terse', '')
+            filtered = [
+                line for line in raw.splitlines()
+                if line.strip() and not ignored.search(line.strip())
+            ]
+            return {'status': 'success', 'data': '\n'.join(filtered), 'vendor': 'juniper'}
 
         else:
             return {'status': 'error', 'message': f'Unsupported vendor: {device.vendor}'}
@@ -557,7 +636,80 @@ def fetch_device_interfaces(device_id):
 
 
 # ============================================================
-# TASK 3 — PORT RESERVATION (undo shutdown + description) - NOT TOUCHED
+# TASK 2.5 — LLDP SWITCH DISCOVERY
+# ============================================================
+
+@shared_task
+def discover_switch_via_lldp(router_id, port_name):
+    """
+    Connects to the router via SSH and runs 'display lldp neighbor brief'
+    to dynamically discover the connected switch on EVE-NG.
+    """
+    from devices.models import Router, Switch
+    try:
+        router = Router.objects.get(id=router_id)
+        port_name_norm = _normalize_huawei_port(port_name)
+
+        if router.vendor.lower() != 'huawei':
+            return {'status': 'error', 'message': 'LLDP discovery is only supported for Huawei routers.'}
+
+        with ConnectHandler(**_huawei_device_params(
+            router.loopback_ip, router.ssh_username, router.ssh_password
+        )) as conn:
+            conn.send_command_timing('screen-length 0 temporary', delay_factor=2)
+            raw_output = conn.send_command('display lldp neighbor brief', read_timeout=30)
+
+        for line in raw_output.splitlines():
+            line_clean = line.strip()
+            if not line_clean or 'Local Intf' in line_clean or '----' in line_clean:
+                continue
+
+            parts = line_clean.split()
+            if len(parts) >= 3:
+                local_intf = _normalize_huawei_port(parts[0])
+
+                if local_intf.lower() == port_name_norm.lower():
+                    neighbor_name = parts[1].strip()
+                    neighbor_port = parts[2].strip()
+
+                    sw_ip     = "10.41.236.34"
+                    sw_vendor = 'juniper'
+
+                    sw_obj = Switch.objects.filter(name__iexact=neighbor_name).first()
+                    if sw_obj:
+                        sw_ip = sw_obj.loopback_ip
+                        if 'cisco' in sw_obj.model.lower():
+                            sw_vendor = 'cisco'
+                    else:
+                        rt_obj = Router.objects.filter(name__iexact=neighbor_name).first()
+                        if rt_obj:
+                            sw_ip = rt_obj.loopback_ip
+                            if 'cisco' in rt_obj.model.lower():
+                                sw_vendor = 'cisco'
+
+                    return {
+                        'status':             'success',
+                        'has_switch':         True,
+                        'switch_name':        neighbor_name,
+                        'switch_ip':          sw_ip,
+                        'switch_port':        neighbor_port,
+                        'switch_uplink_port': neighbor_port,
+                        'switch_vendor':      sw_vendor,
+                        'message':            f"Switch {neighbor_name} ({'Cisco' if sw_vendor == 'cisco' else 'Juniper'}) detected dynamically.",
+                    }
+
+        return {
+            'status':     'success',
+            'has_switch': False,
+            'message':    f"No switch detected via LLDP on port {port_name_norm}.",
+        }
+
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+
+
+# ============================================================
+# TASK 3 — PORT RESERVATION
 # ============================================================
 
 @shared_task(bind=True)
@@ -565,12 +717,12 @@ def execute_port_reservation(self, port_id, router_id, description):
     from devices.models import Router, Port
 
     try:
-        port = Port.objects.get(id=port_id)
+        port   = Port.objects.get(id=port_id)
         router = Router.objects.get(id=router_id)
     except (Port.DoesNotExist, Router.DoesNotExist):
         return "Port or Router record not found."
 
-    lock_key = f'device_lock_{router.loopback_ip}'
+    lock_key      = f'device_lock_{router.loopback_ip}'
     lock_acquired = redis_client.set(lock_key, f"port_res_{port_id}", nx=True, ex=300)
 
     if not lock_acquired:
@@ -581,7 +733,7 @@ def execute_port_reservation(self, port_id, router_id, description):
 
     try:
         if router.vendor.lower() == 'huawei':
-            output_lines = []
+            output_lines    = []
             normalized_port = _normalize_huawei_port(port.port_full_name)
 
             with ConnectHandler(**_huawei_device_params(
@@ -616,8 +768,8 @@ def execute_port_reservation(self, port_id, router_id, description):
         else:
             raise ValueError(f"Unsupported vendor: {router.vendor}")
 
-        port.admin_status = 'active'
-        port.oper_status = 'up'
+        port.admin_status     = 'active'
+        port.oper_status      = 'up'
         port.port_description = description
         port.save()
         return f"Successfully reserved {port.port_full_name}"
@@ -633,7 +785,7 @@ def execute_port_reservation(self, port_id, router_id, description):
 
 
 # ============================================================
-# TASK 4 — INTERNET PROVISIONING - UPDATED FOR DYNAMIC SLICING
+# TASK 4 — INTERNET PROVISIONING
 # ============================================================
 
 @shared_task(bind=True)
@@ -648,8 +800,7 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
     except Exception:
         return "Database records not found."
 
-    # The payload context builder dynamically inherits public_range and subnet_type parameters
-    payload  = build_provisioning_payload(port.port_full_name, task.parameters)
+    payload  = build_provisioning_payload(port.port_full_name, task.parameters, router=router)
     lock_key = f'device_lock_{router.loopback_ip}'
 
     if not redis_client.set(lock_key, f"internet_task_{task_id}", nx=True, ex=300):
@@ -662,18 +813,34 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
         script_parts = []
 
         if payload.get('has_switch') and payload.get('switch_ip'):
+            sw_ip     = payload['switch_ip']
+            sw_vendor = payload.get('switch_vendor', 'juniper')
+
             try:
                 from devices.models import Switch
-                sw = Switch.objects.get(loopback_ip=payload['switch_ip'])
+                sw = Switch.objects.get(loopback_ip=sw_ip)
+                if 'cisco' in getattr(sw, 'model', '').lower():
+                    sw_vendor = 'cisco'
             except Exception:
-                from devices.models import Router as SW
-                sw = SW.objects.get(loopback_ip=payload['switch_ip'])
+                logger.warning(f"Switch {sw_ip} not found in Switch model.")
 
-            sw_driver = JuniperSwitchDriver(sw.loopback_ip, sw.ssh_username, sw.ssh_password)
+            sw_username = router.ssh_username
+            sw_password = router.ssh_password
+
+            if sw_vendor == 'cisco':
+                sw_driver = CiscoSwitchDriver(sw_ip, sw_username, sw_password)
+            else:
+                sw_driver = JuniperSwitchDriver(sw_ip, sw_username, sw_password)
+
             sw_config = sw_driver.generate_config(payload)
             sw_output = sw_driver.execute(sw_config)
-            script_parts.append(f"# Switch {sw.loopback_ip}\n{sw_driver.render_script(payload)}")
-            logger.info(f"Switch provisioned: {sw_output}")
+            logger.info(f"Switch {sw_ip} provisioned: {sw_output}")
+
+            script_parts.append(
+                f"==> port sur sw sans NAT avec CPE\n\n"
+                f"<{sw_ip}>\n"
+                f"{sw_driver.render_script(payload)}"
+            )
 
         pe_driver = get_vendor_driver(
             router.vendor,
@@ -682,20 +849,25 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
             router.ssh_password,
         )
 
-        config_data    = pe_driver.generate_config(payload)
+        config_data      = pe_driver.generate_config(payload)
         execution_output = pe_driver.execute(config_data)
 
-        if hasattr(pe_driver, 'render_script'):
+        if payload.get('has_switch'):
             script_parts.append(
-                f"# PE {router.loopback_ip}\n{pe_driver.render_script(payload)}"
+                f"\n<{router.loopback_ip}>\n"
+                f"{pe_driver.render_script(payload, router_ip=router.loopback_ip).split(chr(10), 4)[-1]}"
+            )
+        else:
+            script_parts.append(
+                pe_driver.render_script(payload, router_ip=router.loopback_ip)
             )
 
-        task.status = 'completed'
-        task.result = execution_output
-        task.script_output = '\n\n'.join(script_parts)
+        task.status        = 'completed'
+        task.result        = execution_output
+        task.script_output = '\n'.join(script_parts)
         task.save()
 
-        port.admin_status   = 'active'
+        port.admin_status     = 'active'
         port.port_description = (
             f"TO_B2B_client_{payload['client_name']}_{payload['media_type']}_INTERNET"
         )

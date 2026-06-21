@@ -1,3 +1,4 @@
+import logging
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, viewsets
@@ -12,19 +13,17 @@ from .tasks import (
     fetch_device_interfaces,
     execute_port_reservation,
     execute_internet_provisioning,
+    discover_switch_via_lldp,
 )
 from devices.models import Router, Port
 
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
 #  BANDWIDTH UPGRADE — CREATE
 # ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def create_bandwidth_upgrade(request):
-    """
-    POST /api/provisioning/bandwidth-upgrade/
-    Body: { device_id, interface, customer_name, new_bandwidth_mbps, [old_bandwidth_mbps, vlan] }
-    """
     data          = request.data
     device_id     = data.get('device_id')
     interface     = data.get('interface')
@@ -49,8 +48,6 @@ def create_bandwidth_upgrade(request):
         status='pending',
     )
 
-    # Fire Celery task AFTER the DB transaction commits to avoid
-    # DoesNotExist errors when the worker picks up the task before the row exists.
     def fire_task():
         task = execute_bandwidth_upgrade.delay(upgrade.upgrade_id)
         BandwidthUpgrade.objects.filter(upgrade_id=upgrade.upgrade_id).update(
@@ -74,9 +71,6 @@ def create_bandwidth_upgrade(request):
 # ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def list_bandwidth_upgrades(request):
-    """
-    GET /api/provisioning/bandwidth-upgrades/?status=completed&device_id=1
-    """
     upgrades = BandwidthUpgrade.objects.all().order_by('-created_at')
 
     if status_filter := request.query_params.get('status'):
@@ -116,7 +110,6 @@ def list_bandwidth_upgrades(request):
 # ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def get_bandwidth_upgrade_detail(request, upgrade_id):
-    """GET /api/provisioning/bandwidth-upgrades/{upgrade_id}/"""
     u = get_object_or_404(BandwidthUpgrade, upgrade_id=upgrade_id)
     return Response({
         'upgrade_id':         u.upgrade_id,
@@ -141,20 +134,18 @@ def get_bandwidth_upgrade_detail(request, upgrade_id):
 
 
 # ─────────────────────────────────────────────────────────────
-#  FETCH INTERFACES — LIVE FROM DEVICE
+#  FETCH INTERFACES — LIVE FROM DEVICE (UNTOUCHED)
 # ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def fetch_interfaces(request):
-    """
-    POST /api/provisioning/fetch-interfaces/
-    Body: { "device_id": 5 }
-    """
     device_id = request.data.get('device_id') or request.data.get('router_id')
     if not device_id:
-        return Response({'error': 'device_id or router_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {'error': 'device_id or router_id is required'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     device = get_object_or_404(Router, id=device_id)
-
     result = fetch_device_interfaces(device.id)
 
     if result['status'] != 'success':
@@ -163,14 +154,11 @@ def fetch_interfaces(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    raw    = result['data']
-    vendor = result.get('vendor', 'huawei')
-
-    interfaces = _parse_interfaces(raw, vendor)
+    interfaces = _parse_interfaces(result['data'], result.get('vendor', 'huawei'))
 
     return Response({
         'status':      'success',
-        'vendor':      vendor,
+        'vendor':      result.get('vendor', 'huawei'),
         'device_id':   device.id,
         'device_name': device.name,
         'interfaces':  interfaces,
@@ -178,35 +166,29 @@ def fetch_interfaces(request):
 
 
 def _parse_interfaces(raw: str, vendor: str) -> list:
-    """
-    Parses raw CLI output into a list of interface dicts.
-    """
     interfaces = []
 
     if vendor == 'huawei':
         for line in raw.splitlines():
             stripped = line.strip()
-
             if not stripped:
                 continue
-            if stripped.startswith('Interface'):
+            if stripped.startswith('Interface') or stripped.startswith('PHY'):
                 continue
             if 'More' in stripped or stripped.startswith('----'):
                 continue
             if stripped.startswith('<') or stripped.startswith('['):
                 continue
-
             if not stripped[0].isalpha():
                 continue
 
             parts = stripped.split()
-
             if len(parts) < 3:
                 continue
 
             name     = parts[0]
-            physical = parts[1]   
-            protocol = parts[2]   
+            physical = parts[1]
+            protocol = parts[2]
             desc     = ' '.join(parts[3:]) if len(parts) > 3 else ''
 
             if any(skip in name for skip in ('NULL', 'LoopBack', 'MEth', 'InLoopBack')):
@@ -222,40 +204,30 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
 
     elif vendor == 'juniper':
         for line in raw.splitlines():
-            # 1. FIXED PROTOCOL PARSING BUG: Juniper indents inner protocol stanzas.
             if line.startswith(' ') or line.startswith('\t'):
                 continue
-
             stripped = line.strip()
             if not stripped or not stripped[0].isalpha():
                 continue
 
             parts = stripped.split()
-            
-            # 2. CRITICAL SAFEGUARD: Prevent IndexError on unformatted protocol lines
             if len(parts) < 3:
                 continue
 
             name = parts[0]
-
-            # 3. FIXED INTERNAL INTERFACE VISIBILITY: Exclude JunOS infrastructure ports
             if any(skip in name for skip in (
-                'lo0', 'fxp', 'bme', 'jsrv', 'dsc',
-                'gre', 'ipip', 'lsi', 'mtun', 'pimd', 'pime', 'tap',
-                'lc-', 'pfe-', 'pfh-', 'irb', 'mif', 'pip', 'fti', 'cbp', 'demux',
-                'em', 'esi', 'pp0', 'rbeb', 'vtep'
+                'lo0', 'fxp', 'bme', 'jsrv', 'dsc', 'gre', 'ipip',
+                'lsi', 'mtun', 'pimd', 'pime', 'tap', 'lc-', 'pfe-',
+                'pfh-', 'irb', 'mif', 'pip', 'fti', 'cbp', 'demux',
+                'em', 'esi', 'pp0', 'rbeb', 'vtep',
             )):
                 continue
 
-            physical = parts[1]
-            protocol = parts[2]
-            desc     = ' '.join(parts[5:]) if len(parts) > 5 else ''
-
             interfaces.append({
                 'name':            name,
-                'physical':        physical,
-                'protocol':        protocol,
-                'description':     desc,
+                'physical':        parts[1],
+                'protocol':        parts[2],
+                'description':     ' '.join(parts[5:]) if len(parts) > 5 else '',
                 'is_subinterface': '.' in name,
             })
 
@@ -263,38 +235,35 @@ def _parse_interfaces(raw: str, vendor: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-#  GET PORT ID (DYNAMIC LOOKUP/CREATE)
+#  GET PORT ID
 # ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def get_port_id(request):
-    """
-    GET /api/port-id/?router_id=213&port_name=Eth1/0/3
-    """
     router_id = request.query_params.get('router_id')
     port_name = request.query_params.get('port_name')
 
     if not router_id or not port_name:
         return Response(
-            {'error': 'router_id and port_name are required'}, 
-            status=status.HTTP_400_BAD_REQUEST
+            {'error': 'router_id and port_name are required'},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     router = get_object_or_404(Router, id=router_id)
 
-    # Automatically find the port, or initialize it in the DB if it's a fresh live fetch
     port, created = Port.objects.get_or_create(
         ne_name=router.name,
         port_full_name=port_name,
         defaults={
-            'port_name': port_name,
+            'port_name':    port_name,
             'admin_status': 'inactive',
-            'oper_status': 'down'
+            'oper_status':  'down',
         }
     )
 
     return Response({
         'port_id': port.id,
-        'message': 'Port created dynamically.' if created else 'Port found.'
+        'created': created,
+        'message': 'Port created.' if created else 'Port found.',
     })
 
 
@@ -303,10 +272,6 @@ def get_port_id(request):
 # ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def reserve_port(request):
-    """
-    POST /api/provisioning/reserve-port/
-    Body: { "router_id": 5, "port_id": 12, "interface_name": "ge-0/0/0.0", "description": "..." }
-    """
     router_id      = request.data.get('router_id') or request.data.get('device_id')
     port_id        = request.data.get('port_id')
     interface_name = request.data.get('interface_name') or request.data.get('interface')
@@ -314,29 +279,26 @@ def reserve_port(request):
 
     if not router_id:
         return Response(
-            {'error': 'router_id or device_id is required'},
+            {'error': 'router_id is required'},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     router = get_object_or_404(Router, id=router_id)
 
     with transaction.atomic():
-        available_port = None
-        
-        # Strategy A: Query explicitly by Primary Key ID if provided by the client parameters
+        port = None
+
         if port_id:
-            available_port = Port.objects.select_for_update().filter(id=port_id).first()
-            
-        # Strategy B: Fallback string lookup matching the parsed string name directly under this Router
-        if not available_port and interface_name:
-            available_port = Port.objects.select_for_update().filter(
+            port = Port.objects.select_for_update().filter(id=port_id).first()
+
+        if not port and interface_name:
+            port = Port.objects.select_for_update().filter(
                 ne_name=router.name,
-                port_full_name=interface_name
+                port_full_name=interface_name,
             ).first()
-            
-        # Strategy C: Dynamic factory generation if the entry doesn't exist inside the database schema yet
-        if not available_port and interface_name:
-            available_port = Port.objects.create(
+
+        if not port and interface_name:
+            port = Port.objects.create(
                 ne_name=router.name,
                 port_full_name=interface_name,
                 port_name=interface_name,
@@ -344,38 +306,32 @@ def reserve_port(request):
                 oper_status='down',
             )
 
-        if not available_port:
+        if not port:
             return Response(
-                {
-                    'status':  'error',
-                    'message': 'Port record could not be found or dynamically initialized inside the schema.',
-                },
+                {'error': 'Port not found and could not be created. Provide port_id or interface_name.'},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Allow reservation if it is inactive OR if it's already pending retry
-        if available_port.admin_status not in ('inactive', 'pending_reservation'):
+        if port.admin_status not in ('inactive', 'pending_reservation'):
             return Response(
-                {
-                    'status':  'error',
-                    'message': f'Port {available_port.port_full_name} is already active or allocated.',
-                },
+                {'error': f'Port {port.port_full_name} is already active or allocated.'},
                 status=status.HTTP_409_CONFLICT,
             )
 
-        available_port.admin_status = 'pending_reservation'
-        available_port.save()
+        port.admin_status = 'pending_reservation'
+        port.save()
 
     def fire_ssh_task():
-        execute_port_reservation.delay(available_port.id, router.id, description)
+        execute_port_reservation.delay(port.id, router.id, description)
 
     transaction.on_commit(fire_ssh_task)
 
     return Response(
         {
             'status':    'processing',
-            'port_name': available_port.port_full_name,
-            'message':   f'Port {available_port.port_full_name} locked. Configuring router now...',
+            'port_id':   port.id,
+            'port_name': port.port_full_name,
+            'message':   f'Port {port.port_full_name} locked. Configuring router now...',
         },
         status=status.HTTP_202_ACCEPTED,
     )
@@ -386,12 +342,11 @@ def reserve_port(request):
 # ─────────────────────────────────────────────────────────────
 @api_view(['GET'])
 def list_port_reservations(request):
-    """GET /api/provisioning/port-reservations/"""
     reservations = Port.objects.filter(
         admin_status='pending_reservation'
     ).order_by('-id')
 
-    data = [
+    return Response([
         {
             'id':          p.id,
             'port_name':   p.port_full_name,
@@ -400,8 +355,7 @@ def list_port_reservations(request):
             'description': p.port_description,
         }
         for p in reservations
-    ]
-    return Response(data)
+    ])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -409,7 +363,6 @@ def list_port_reservations(request):
 # ─────────────────────────────────────────────────────────────
 @api_view(['POST'])
 def retry_upgrade(request, upgrade_id):
-    """POST /api/provisioning/bandwidth-upgrades/{upgrade_id}/retry/"""
     upgrade = get_object_or_404(BandwidthUpgrade, upgrade_id=upgrade_id)
 
     if upgrade.status != 'failed':
@@ -435,21 +388,49 @@ def retry_upgrade(request, upgrade_id):
 
 
 # ─────────────────────────────────────────────────────────────
+#  SYNC_SW — DÉCOUVERTE DU SWITCH EN DIRECT DEPUIS EVE-NG
+# ─────────────────────────────────────────────────────────────
+@api_view(['POST'])
+def fetch_switch_for_port(request):
+    router_id = request.data.get('router_id')
+    port_name = request.data.get('port_name')
+
+    if not router_id or not port_name:
+        return Response(
+            {'error': 'router_id and port_name are required'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    result = discover_switch_via_lldp(router_id, port_name)
+
+    if result['status'] == 'error':
+        return Response(
+            {'has_switch': False, 'message': result['message']},
+            status=status.HTTP_502_BAD_GATEWAY
+        )
+
+    return Response({
+        'has_switch':         result.get('has_switch', False),
+        'switch_name':        result.get('switch_name', ''),
+        'switch_ip':          result.get('switch_ip', ''),
+        'switch_uplink_port': result.get('switch_uplink_port', 'ge-0/1/0'),
+        'switch_port':        result.get('switch_port', ''),
+        'switch_vendor':      result.get('switch_vendor', 'juniper'), # Utilisé pour adapter le comportement au modèle
+        'message':            result.get('message', ''),
+    }, status=status.HTTP_200_OK)
+
+
+# ─────────────────────────────────────────────────────────────
 #  INTERNET PROVISIONING — START
 # ─────────────────────────────────────────────────────────────
 class StartProvisioningView(APIView):
-    """
-    POST /api/provisioning/start/
-    """
     def post(self, request):
         serializer = ProvisioningTaskSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Extract the device name from the validated payload
         device_name = serializer.validated_data.get('device_name')
 
-       # 2. Fetch the router object FIRST (Case-Insensitive)
         try:
             router = Router.objects.get(name__iexact=device_name)
         except Router.DoesNotExist:
@@ -458,14 +439,14 @@ class StartProvisioningView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # 3. Save the task while simultaneously injecting the automatic IP
         task = serializer.save(device_ip=router.loopback_ip)
 
         if task.task_type == 'internet':
             port_id = task.parameters.get('port_id')
             if not port_id:
+                task.delete()
                 return Response(
-                    {'error': 'port_id is required in parameters for internet service'},
+                    {'error': 'port_id is required in parameters for internet provisioning'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -480,7 +461,10 @@ class StartProvisioningView(APIView):
                     task.status = 'failed'
                     task.result = 'Port is already in use or does not exist.'
                     task.save()
-                    return Response({'error': 'Port unavailable.'}, status=status.HTTP_409_CONFLICT)
+                    return Response(
+                        {'error': 'Port unavailable or already allocated.'},
+                        status=status.HTTP_409_CONFLICT,
+                    )
 
                 port.admin_status = 'pending_provisioning'
                 port.save()
@@ -498,7 +482,7 @@ class StartProvisioningView(APIView):
                 {
                     'task_id': task.id,
                     'status':  'queued',
-                    'message': f'Internet provisioning queued for {task.device_name}',
+                    'message': f'Internet provisioning queued for {router.name}',
                 },
                 status=status.HTTP_202_ACCEPTED,
             )
@@ -516,8 +500,7 @@ class StartProvisioningView(APIView):
 
             def fire_task():
                 celery_task = execute_port_reservation.delay(
-                    port.id,
-                    router.id,
+                    port.id, router.id,
                     f'{task.task_type} via NOC Dashboard',
                 )
                 ProvisioningTask.objects.filter(id=task.id).update(
@@ -531,7 +514,7 @@ class StartProvisioningView(APIView):
                 {
                     'task_id': task.id,
                     'status':  'queued',
-                    'message': f'Provisioning started for {task.device_name}',
+                    'message': f'Provisioning started for {router.name}',
                 },
                 status=status.HTTP_202_ACCEPTED,
             )
@@ -549,7 +532,6 @@ class StartProvisioningView(APIView):
 #  PROVISIONING TASK — STATUS
 # ─────────────────────────────────────────────────────────────
 class ProvisioningStatusView(APIView):
-    """GET /api/provisioning/status/<task_id>/"""
     def get(self, request, task_id):
         try:
             task = ProvisioningTask.objects.get(id=task_id)
@@ -571,7 +553,7 @@ class ProvisioningStatusView(APIView):
 
 
 # ─────────────────────────────────────────────────────────────
-#  PROVISIONING TASKS — VIEWSET (read-only list/retrieve)
+#  PROVISIONING TASKS — VIEWSET
 # ─────────────────────────────────────────────────────────────
 class ProvisioningTaskViewSet(viewsets.ReadOnlyModelViewSet):
     queryset         = ProvisioningTask.objects.all()

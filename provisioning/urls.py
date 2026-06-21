@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import StartProvisioningView, ProvisioningStatusView, ProvisioningTaskViewSet, reserve_port
+from .views import StartProvisioningView, ProvisioningStatusView, ProvisioningTaskViewSet, reserve_port, fetch_switch_for_port
 from . import views
 
 router = DefaultRouter()
@@ -18,7 +18,7 @@ urlpatterns = [
     
     # ─── ADDED FOR ANGULAR PRE-CHECK LOOKUP ───
     path('port-id/', views.get_port_id, name='get-port-id'),
-    
+    path('fetch-switch/', fetch_switch_for_port, name='fetch-switch'), # <-- AJOUTE CETTE LIGNE
     path('reserve-port/', reserve_port, name='reserve-port'),
     path('port-reservations/', views.list_port_reservations, name='list-port-reservations'),
 ]
