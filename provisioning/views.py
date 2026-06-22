@@ -415,7 +415,7 @@ def fetch_switch_for_port(request):
         'switch_ip':          result.get('switch_ip', ''),
         'switch_uplink_port': result.get('switch_uplink_port', 'ge-0/1/0'),
         'switch_port':        result.get('switch_port', ''),
-        'switch_vendor':      result.get('switch_vendor', 'juniper'), # Utilisé pour adapter le comportement au modèle
+        'switch_vendor':      result.get('switch_vendor', 'juniper'), 
         'message':            result.get('message', ''),
     }, status=status.HTTP_200_OK)
 
@@ -426,6 +426,7 @@ def fetch_switch_for_port(request):
 class StartProvisioningView(APIView):
     def post(self, request):
         serializer = ProvisioningTaskSerializer(data=request.data)
+        
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -442,13 +443,27 @@ class StartProvisioningView(APIView):
         task = serializer.save(device_ip=router.loopback_ip)
 
         if task.task_type == 'internet':
-            port_id = task.parameters.get('port_id')
+            params = task.parameters if isinstance(task.parameters, dict) else {}
+            
+            port_id = params.get('port_id')
             if not port_id:
                 task.delete()
                 return Response(
                     {'error': 'port_id is required in parameters for internet provisioning'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            # ── AUTOMATED BACKEND IP INJECTION ──
+            # The backend is now fully responsible for defining the public IP block.
+            # It no longer requires or validates a public_range from the frontend.
+            
+            # NOTE: If you eventually add an IPAM/Database model to pull available ranges, 
+            # query it here. For now, we inject the master range automatically:
+            automated_public_range = "196.203.0.0/24"
+            
+            params['public_range'] = automated_public_range
+            task.parameters = params
+            task.save()
 
             with transaction.atomic():
                 port = Port.objects.select_for_update().filter(
@@ -488,12 +503,14 @@ class StartProvisioningView(APIView):
             )
 
         elif task.task_type in ('configure_vlan', 'firmware_upgrade', 'push_acl'):
+            params = task.parameters if isinstance(task.parameters, dict) else {}
+            
             port = Port.objects.filter(ne_name=router.name).first()
             if not port:
                 port = Port.objects.create(
                     ne_name=router.name,
-                    port_full_name=task.parameters.get('interface', 'Ethernet1/0/1'),
-                    port_name=task.parameters.get('interface', 'Ethernet1/0/1'),
+                    port_full_name=params.get('interface', 'Ethernet1/0/1'),
+                    port_name=params.get('interface', 'Ethernet1/0/1'),
                     admin_status='inactive',
                     oper_status='down',
                 )

@@ -2,6 +2,7 @@ import redis
 import logging
 import time
 import re
+import random
 from celery import shared_task
 from django.utils import timezone
 from netmiko import ConnectHandler
@@ -127,12 +128,6 @@ def find_switch_for_port(router, port_name):
 def _get_pe_ip_from_range(public_range: str, subnet_type: str) -> str:
     """
     Auto-derives the PE IP from the selected public range and subnet type.
-    Returns the first usable host of the first subnet of the given prefix.
-
-    Examples:
-      '196.203.0.0/24' + '/30' → '196.203.0.1'
-      '196.203.0.0/24' + '/29' → '196.203.0.1'
-      '196.203.0.0/24' + '/31' → '196.203.0.0'
     """
     import ipaddress
     try:
@@ -141,14 +136,48 @@ def _get_pe_ip_from_range(public_range: str, subnet_type: str) -> str:
         subnets    = list(network.subnets(new_prefix=prefix_len))
         if not subnets:
             return ''
-        first_subnet = subnets[0]
-        hosts = list(first_subnet.hosts())
+            
+        # LAB FIX: Pick a random subnet instead of always grabbing [0]
+        # This prevents IP conflicts when running multiple tests in EVE-NG
+        chosen_subnet = random.choice(subnets)
+        
+        hosts = list(chosen_subnet.hosts())
         # /31 has no hosts() in Python — use network addresses directly
         if not hosts:
-            hosts = list(first_subnet)
+            hosts = list(chosen_subnet)
         return str(hosts[0]) if hosts else ''
     except Exception as e:
         logger.warning(f"PE IP derivation failed for {public_range} + {subnet_type}: {e}")
+        return ''
+
+
+def _get_ce_ip(pe_ip: str, subnet_type: str) -> str:
+    """
+    Derives the CE IP from the PE IP and subnet mask.
+    Assuming the PE is the first host, the CE will be the second.
+    """
+    if not pe_ip or not subnet_type:
+        return ''
+        
+    import ipaddress
+    try:
+        network = ipaddress.ip_network(f"{pe_ip}{subnet_type}", strict=False)
+        hosts = list(network.hosts())
+        
+        # Handle /31 which has no "hosts" in the traditional sense
+        if not hosts:
+            hosts = list(network)
+            
+        if len(hosts) > 1:
+            # If PE is the first IP, CE is the second
+            if str(hosts[0]) == pe_ip:
+                return str(hosts[1])
+            # If PE is the second IP, CE is the first
+            elif str(hosts[1]) == pe_ip:
+                return str(hosts[0])
+        return ''
+    except Exception as e:
+        logger.warning(f"CE IP derivation failed for {pe_ip} + {subnet_type}: {e}")
         return ''
 
 
@@ -207,6 +236,26 @@ def build_provisioning_payload(port_name, params, router=None):
     if not pe_ip and params.get('public_range') and subnet_type:
         pe_ip = _get_pe_ip_from_range(params['public_range'], subnet_type)
 
+    # GUARD: pe_ip must not be empty — double space in 'ip address  255.x.x.x'
+    # causes VRP incomplete command error.
+    if not pe_ip:
+        logger.error(f"❌ DERIVATION FAILED! Received parameters: public_range='{params.get('public_range')}', subnet_type='{subnet_type}'")
+        raise ValueError(
+            "PE IP address is required. Send 'pe_ip_address' in the form parameters."
+        )
+
+    # ── CE IP: Auto-derive based on the PE IP ──
+    ce_ip = params.get('ce_ip_address') or params.get('ce_ip') or ''
+    if not ce_ip:
+        ce_ip = _get_ce_ip(pe_ip, subnet_type)
+        
+    # ── LAN Prefix: Handle your backend generation logic here ──
+    cust_lan_prefix = params.get('customer_lan_prefix', '')
+    if not cust_lan_prefix:
+        # TODO: Add your logic here to pull a LAN prefix from an IPAM or DB pool
+        # cust_lan_prefix = get_next_available_lan_pool()
+        pass
+
     return {
         'client_name':        params.get('client_name', 'Unknown'),
         'port_name':          port_name,
@@ -219,8 +268,8 @@ def build_provisioning_payload(port_name, params, router=None):
         'qos_profile':        qos_profile,
         'qos_mbps':           qos_debit,
         'nat_mode':           params.get('nat_mode'),
-        'ce_ip':              params.get('ce_ip_address') or params.get('ce_ip') or '',
-        'cust_lan_prefix':    params.get('customer_lan_prefix', ''),
+        'ce_ip':              ce_ip,
+        'cust_lan_prefix':    cust_lan_prefix,
         'cust_lan_cidr':      params.get('customer_lan_cidr', ''),
         'has_switch':         has_switch,
         'switch_ip':          switch_ip,
@@ -279,12 +328,16 @@ class HuaweiDriver(ProvisioningDriver):
 
     STATIC_ROUTE_TEMPLATE = (
         "ip route-static vpn-instance {{ vrf_name }} "
-        "{{ cust_lan_prefix }} {{ subnet_mask }} {{ ce_ip }}"
+        "{{ cust_lan_prefix }} {{ ce_ip }}"
         "  description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET"
     )
 
-    # Lab-safe: no qos-profile, no trust upstream default (image rejects them)
+    # Automated VRF instantiation profiles embedded natively inside the lab provisioning scope
     LAB_SUB_TEMPLATE = (
+        "ip vpn-instance {{ vrf_name }}\n"
+        " route-distinguisher 100:1\n"
+        " vpn-target 100:1 both\n"
+        "quit\n"
         "interface {{ port_name }}.{{ vlan }}\n"
         "vlan-type dot1q {{ vlan }}\n"
         "description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET\n"
