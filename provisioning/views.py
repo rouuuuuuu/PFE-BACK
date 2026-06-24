@@ -568,7 +568,17 @@ class ProvisioningStatusView(APIView):
             'completed_at':  task.completed_at,
         })
 
+@api_view(['POST'])
+def liberate_port(request, task_id):
+    from provisioning.models import ProvisioningTask
+    from devices.models import Port, Router
 
+    task   = get_object_or_404(ProvisioningTask, id=task_id)
+    router = task.router          # adjust to your actual FK field name
+    port   = task.port            # adjust to your actual FK field name
+
+    job = execute_port_liberation.delay(task.id, router.id, port.id)
+    return Response({'job_id': job.id, 'status': 'queued'})
 # ─────────────────────────────────────────────────────────────
 #  PROVISIONING TASKS — VIEWSET
 # ─────────────────────────────────────────────────────────────

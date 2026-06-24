@@ -65,32 +65,103 @@ def _hw_commit_save(conn, output_lines):
 
 
 def _juniper_push(host, username, password, config_string, max_attempts=5):
-    """Push set-format config to Juniper via NETCONF. Retries for slow EVE-NG boots."""
+    """
+    Push set-format config to Juniper via NETCONF.
+    Handles EVE-NG vJunos ConnectClosedError during commit by reconnecting
+    and verifying the config was actually applied.
+    """
     from jnpr.junos.utils.config import Config
+    from jnpr.junos.exception import ConnectClosedError, CommitError
     from napalm.base.exceptions import ConnectionException
+    import time
 
     driver = get_network_driver('junos')
     last_exc = None
 
+    def _open_dev():
+        dev = driver(
+            hostname=host,
+            username=username,
+            password=password,
+            optional_args={'port': 830},
+        )
+        dev.open()
+        dev.device.timeout = 180
+        return dev
+
     for attempt in range(1, max_attempts + 1):
         try:
-            with driver(
-                hostname=host,
-                username=username,
-                password=password,
-                optional_args={'port': 830},
-            ) as dev:
-                cu = Config(dev.device)
-                cu.load(config_string, format='set', ignore_warning=True)
-                cu.commit()
-            return f"Committed to {host}:\n{config_string}"
-        except ConnectionException as e:
+            dev = _open_dev()
+        except Exception as e:
             last_exc = e
             logger.warning(f"NETCONF not ready on {host} (attempt {attempt}/{max_attempts}) — retrying in 15s")
             time.sleep(15)
+            continue
 
-    raise ConnectionException(f"Could not connect to {host} after {max_attempts} attempts: {last_exc}")
+        try:
+            cu = Config(dev.device)
+            cu.load(config_string, format='set', ignore_warning=True)
 
+            commit_ok = False
+            try:
+                cu.commit(timeout=180)
+                commit_ok = True
+            except ConnectClosedError:
+                # vJunos EVE-NG drops the socket mid-commit but often commits anyway.
+                # Reconnect and verify rather than failing immediately.
+                logger.warning(
+                    f"[{host}] ConnectClosedError during commit (attempt {attempt}) — "
+                    f"reconnecting to verify..."
+                )
+                time.sleep(8)  # Give vJunos time to finish the commit before reconnecting
+
+                try:
+                    dev2 = _open_dev()
+                    # Probe: if we can open a new session, the device is alive.
+                    # Check candidate vs running diff — empty diff = commit landed.
+                    cu2 = Config(dev2.device)
+                    diff = cu2.diff()
+                    dev2.close()
+
+                    if diff is None or diff.strip() == '':
+                        # No pending diff → config was committed successfully
+                        logger.info(f"[{host}] Post-reconnect diff is empty — commit confirmed.")
+                        commit_ok = True
+                    else:
+                        # There's still a diff — commit did NOT land, retry
+                        logger.warning(f"[{host}] Post-reconnect diff not empty — commit may not have landed.")
+                        last_exc = ConnectClosedError(host)
+                except Exception as verify_exc:
+                    logger.warning(f"[{host}] Reconnect/verify also failed: {verify_exc}")
+                    last_exc = verify_exc
+
+            if commit_ok:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                return f"Committed to {host}:\n{config_string}"
+
+        except CommitError as e:
+            logger.error(f"[{host}] CommitError: {e}")
+            try:
+                cu.rollback()
+                dev.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"Juniper commit error on {host}: {e}")
+
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"[{host}] Exception during push (attempt {attempt}): {e}")
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+        time.sleep(15)
+
+    raise ConnectionException(f"Could not commit to {host} after {max_attempts} attempts: {last_exc}")
 
 # ============================================================
 # SWITCH TOPOLOGY LOOKUP
@@ -207,7 +278,13 @@ def build_provisioning_payload(port_name, params, router=None):
     qos_debit   = int(debit_mbps * 0.95) if media_type == 'fh' else debit_mbps
     qos_profile = f"shaping{qos_debit}"
 
-    subnet_type = params.get('subnet_type', '/30')
+    # ── SAFE SUBNET TYPE CLEANING ──
+    raw_subnet = params.get('subnet_type')
+    if not raw_subnet or str(raw_subnet).strip().lower() in ['none', 'null', '']:
+        subnet_type = '/30'
+    else:
+        subnet_type = str(raw_subnet).strip()
+
     mask_map = {
         '/28': '255.255.255.240',
         '/29': '255.255.255.248',
@@ -230,14 +307,11 @@ def build_provisioning_payload(port_name, params, router=None):
             switch_vendor = 'cisco' if 'cisco' in getattr(sw, 'model', '').lower() else 'juniper'
 
     # ── PE IP: auto-derive from public_range + subnet_type if not provided ──
-    # The user selects the public range and subnet size — PE IP is computed
-    # automatically as the first usable host of the first subnet in that range.
     pe_ip = params.get('pe_ip_address') or params.get('pe_ip') or ''
     if not pe_ip and params.get('public_range') and subnet_type:
         pe_ip = _get_pe_ip_from_range(params['public_range'], subnet_type)
 
-    # GUARD: pe_ip must not be empty — double space in 'ip address  255.x.x.x'
-    # causes VRP incomplete command error.
+    # GUARD: pe_ip must not be empty
     if not pe_ip:
         logger.error(f"❌ DERIVATION FAILED! Received parameters: public_range='{params.get('public_range')}', subnet_type='{subnet_type}'")
         raise ValueError(
@@ -252,8 +326,6 @@ def build_provisioning_payload(port_name, params, router=None):
     # ── LAN Prefix: Handle your backend generation logic here ──
     cust_lan_prefix = params.get('customer_lan_prefix', '')
     if not cust_lan_prefix:
-        # TODO: Add your logic here to pull a LAN prefix from an IPAM or DB pool
-        # cust_lan_prefix = get_next_available_lan_pool()
         pass
 
     return {
@@ -332,7 +404,6 @@ class HuaweiDriver(ProvisioningDriver):
         "  description TO_B2B_client_{{ client_name }}_{{ media_type }}_INTERNET"
     )
 
-    # Automated VRF instantiation profiles embedded natively inside the lab provisioning scope
     LAB_SUB_TEMPLATE = (
         "ip vpn-instance {{ vrf_name }}\n"
         " route-distinguisher 100:1\n"
@@ -382,9 +453,7 @@ class HuaweiDriver(ProvisioningDriver):
             time.sleep(3)
             conn.read_channel()
 
-            # Physical interface block (scripts 22/23 only, not 25)
             if config_data['phys_lines']:
-                # Strip leading spaces — VRP rejects indented commands via raw channel
                 phys_cmds = [l.strip() for l in config_data['phys_lines'] if l.strip()]
                 _hw_send(conn, phys_cmds[0], output_lines, sleep=3)
                 for cmd in phys_cmds[1:]:
@@ -393,8 +462,6 @@ class HuaweiDriver(ProvisioningDriver):
                 time.sleep(2)
                 conn.read_channel()
 
-            # Sub-interface block — lab-safe, no qos-profile
-            # LAB_SUB_TEMPLATE has no leading spaces so strip() is safe
             lab_cmds = [l.strip() for l in config_data['lab_sub_lines'] if l.strip()]
             _hw_send(conn, lab_cmds[0], output_lines, sleep=3)
             for cmd in lab_cmds[1:]:
@@ -506,7 +573,7 @@ class JuniperDriver(ProvisioningDriver):
         "set interfaces {{ junos_port }} unit {{ vlan }} family inet address {{ pe_ip }}{{ subnet_cidr }}\n"
         "set routing-instances INTERNET interface {{ junos_port }}.{{ vlan }}\n"
         "set class-of-service interfaces {{ junos_port }} unit {{ vlan }} shaping-rate {{ qos_mbps }}m"
-        "{% if nat_mode in ('sans_nat_avec_cpe', 'avec_nat') and ce_ip %}\n"
+        "{% if nat_mode in ('sans_nat_avec_cpe', 'avec_nat') and ce_ip and cust_lan_cidr %}\n"
         "set routing-instances INTERNET routing-options static route {{ cust_lan_cidr }} next-hop {{ ce_ip }}"
         "{% endif %}"
     )
@@ -932,6 +999,143 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
         logger.error(f"Provisioning failed on {router.loopback_ip}: {str(e)}")
         task.status = 'failed'
         task.result = str(e)
+        task.save()
+        raise e
+
+    finally:
+        redis_client.delete(lock_key)
+# ============================================================
+# TASK 5 — LIBERATE PORT (undo internet provisioning)
+# ============================================================
+
+@shared_task(bind=True)
+def execute_port_liberation(self, task_id, router_id, port_id):
+    from devices.models import Router, Port
+    from provisioning.models import ProvisioningTask
+
+    try:
+        task   = ProvisioningTask.objects.get(id=task_id)
+        router = Router.objects.get(id=router_id)
+        port   = Port.objects.get(id=port_id)
+    except Exception as e:
+        return f"DB record not found: {e}"
+
+    lock_key = f'device_lock_{router.loopback_ip}'
+    if not redis_client.set(lock_key, f"liberation_{task_id}", nx=True, ex=300):
+        raise self.retry(countdown=60, max_retries=3)
+
+    try:
+        params   = task.parameters
+        vlan     = params.get('vlan')
+        vendor   = router.vendor.lower()
+        port_name = _normalize_huawei_port(port.port_full_name)
+
+        # ── Build sub-interface name ──────────────────────────────────────
+        if vlan and '.' not in port_name:
+            sub_iface = f"{port_name}.{vlan}"
+        else:
+            sub_iface = port_name   # already includes .VLAN
+
+        vrf_name = params.get('vrf_name', 'Internet_vpn')
+
+        # ── HUAWEI ───────────────────────────────────────────────────────
+        if vendor == 'huawei':
+            output_lines = []
+
+            with ConnectHandler(**_huawei_device_params(
+                router.loopback_ip, router.ssh_username, router.ssh_password
+            )) as conn:
+
+                conn.write_channel('system-view\n')
+                time.sleep(3)
+                conn.read_channel()
+
+                # 1. Delete the sub-interface entirely — this removes IP, VRF
+                #    binding, QoS, description in one shot on VRP
+                _hw_send(conn, f'undo interface {sub_iface}', output_lines, sleep=3)
+
+                # 2. Reset physical interface description
+                _hw_send(conn, f'interface {port_name}', output_lines, sleep=2)
+                _hw_send(conn, 'undo description', output_lines)
+                _hw_send(conn, 'shutdown', output_lines)
+
+                conn.write_channel('quit\n')
+                time.sleep(2)
+                conn.read_channel()
+
+                # 3. Remove static route if it exists
+                pe_ip           = params.get('pe_ip_address') or params.get('pe_ip', '')
+                ce_ip           = params.get('ce_ip_address') or params.get('ce_ip', '')
+                cust_lan_prefix = params.get('customer_lan_prefix', '')
+                nat_mode        = params.get('nat_mode', '')
+
+                if (
+                    nat_mode in ('sans_nat_avec_cpe', 'avec_nat')
+                    and ce_ip
+                    and cust_lan_prefix
+                ):
+                    _hw_send(
+                        conn,
+                        f'undo ip route-static vpn-instance {vrf_name} {cust_lan_prefix} {ce_ip}',
+                        output_lines,
+                        check_error=False   # non-fatal if route didn't exist
+                    )
+
+                _hw_commit_save(conn, output_lines)
+
+            execution_output = "\n".join(output_lines)
+
+        # ── JUNIPER ──────────────────────────────────────────────────────
+        elif vendor == 'juniper':
+            junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
+            unit       = str(vlan) if vlan else '0'
+
+            lines = [
+                # Remove the logical unit entirely
+                f'delete interfaces {junos_port} unit {unit}',
+                # Remove routing-instance binding
+                f'delete routing-instances INTERNET interface {junos_port}.{unit}',
+            ]
+
+            # Remove static route if CPE mode
+            nat_mode        = params.get('nat_mode', '')
+            ce_ip           = params.get('ce_ip_address') or params.get('ce_ip', '')
+            cust_lan_cidr   = params.get('customer_lan_cidr', '')
+
+            if (
+                nat_mode in ('sans_nat_avec_cpe', 'avec_nat')
+                and ce_ip
+                and cust_lan_cidr
+            ):
+                lines.append(
+                    f'delete routing-instances INTERNET routing-options static route {cust_lan_cidr}'
+                )
+
+            config_string    = '\n'.join(lines)
+            execution_output = _juniper_push(
+                router.loopback_ip, router.ssh_username, router.ssh_password, config_string
+            )
+
+        else:
+            raise ValueError(f"Unsupported vendor: {router.vendor}")
+
+        # ── DB cleanup ───────────────────────────────────────────────────
+        task.status        = 'liberated'
+        task.result        = execution_output
+        task.script_output = ''
+        task.save()
+
+        port.admin_status     = 'available'
+        port.oper_status      = 'down'
+        port.port_description = ''
+        port.save()
+
+        return f"Port {port.port_full_name} liberated successfully."
+
+    except Exception as e:
+        logger.error(f"Liberation failed on {router.loopback_ip}: {str(e)}")
+        task.status = 'failed'
+        task.result = f"Liberation error: {str(e)}"
         task.save()
         raise e
 
