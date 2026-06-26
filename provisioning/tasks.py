@@ -762,66 +762,113 @@ def fetch_device_interfaces(device_id):
 @shared_task
 def discover_switch_via_lldp(router_id, port_name):
     """
-    Connects to the router via SSH and runs 'display lldp neighbor brief'
+    Connects to the router via SSH/NETCONF and runs vendor-specific LLDP commands
     to dynamically discover the connected switch on EVE-NG.
     """
     from devices.models import Router, Switch
     try:
         router = Router.objects.get(id=router_id)
-        port_name_norm = _normalize_huawei_port(port_name)
 
-        if router.vendor.lower() != 'huawei':
-            return {'status': 'error', 'message': 'LLDP discovery is only supported for Huawei routers.'}
-
-        with ConnectHandler(**_huawei_device_params(
-            router.loopback_ip, router.ssh_username, router.ssh_password
-        )) as conn:
-            conn.send_command_timing('screen-length 0 temporary', delay_factor=2)
-            raw_output = conn.send_command('display lldp neighbor brief', read_timeout=30)
-
-        for line in raw_output.splitlines():
-            line_clean = line.strip()
-            if not line_clean or 'Local Intf' in line_clean or '----' in line_clean:
-                continue
-
-            parts = line_clean.split()
-            if len(parts) >= 3:
-                local_intf = _normalize_huawei_port(parts[0])
-
-                if local_intf.lower() == port_name_norm.lower():
-                    neighbor_name = parts[1].strip()
-                    neighbor_port = parts[2].strip()
-
-                    sw_ip     = "10.41.236.34"
-                    sw_vendor = 'juniper'
-
-                    sw_obj = Switch.objects.filter(name__iexact=neighbor_name).first()
-                    if sw_obj:
-                        sw_ip = sw_obj.loopback_ip
-                        if 'cisco' in sw_obj.model.lower():
-                            sw_vendor = 'cisco'
-                    else:
-                        rt_obj = Router.objects.filter(name__iexact=neighbor_name).first()
-                        if rt_obj:
-                            sw_ip = rt_obj.loopback_ip
-                            if 'cisco' in rt_obj.model.lower():
+        # ── JUNIPER ROUTER INTERFACE DISCOVERY ──
+        if router.vendor.lower() == 'juniper':
+            driver = get_network_driver('junos')
+            dev = driver(
+                hostname=router.loopback_ip,
+                username=router.ssh_username,
+                password=router.ssh_password,
+                optional_args={'port': 830},
+            )
+            dev.open()
+            result = dev.cli(['show lldp neighbors'])
+            dev.close()
+            
+            raw_output = result.get('show lldp neighbors', '')
+            
+            for line in raw_output.splitlines():
+                line_clean = line.strip()
+                if not line_clean or line_clean.startswith('Local Interface') or not line_clean.startswith('ge-'):
+                    continue
+                
+                parts = line_clean.split()
+                if len(parts) >= 5:
+                    local_intf    = parts[0].strip()   
+                    neighbor_port = parts[3].strip()   
+                    neighbor_name = parts[4].strip()   
+                    
+                    if local_intf.lower() == port_name.lower():
+                        sw_ip = "10.41.74.199" 
+                        sw_vendor = 'cisco' if 'cisco' in neighbor_name.lower() or 'sw' in neighbor_name.lower() else 'juniper'
+                        
+                        sw_obj = Switch.objects.filter(name__iexact=neighbor_name).first()
+                        if sw_obj:
+                            sw_ip = sw_obj.loopback_ip
+                            if 'cisco' in sw_obj.model.lower():
                                 sw_vendor = 'cisco'
+                                
+                        return {
+                            'status':             'success',
+                            'has_switch':          True,
+                            'switch_name':        neighbor_name,
+                            'switch_ip':          sw_ip,
+                            'switch_port':        neighbor_port,
+                            'switch_uplink_port': neighbor_port,
+                            'switch_vendor':      sw_vendor,
+                            'message':            f"Switch {neighbor_name} ({sw_vendor.upper()}) detected dynamically on Juniper {router.name}.",
+                        }
 
-                    return {
-                        'status':             'success',
-                        'has_switch':         True,
-                        'switch_name':        neighbor_name,
-                        'switch_ip':          sw_ip,
-                        'switch_port':        neighbor_port,
-                        'switch_uplink_port': neighbor_port,
-                        'switch_vendor':      sw_vendor,
-                        'message':            f"Switch {neighbor_name} ({'Cisco' if sw_vendor == 'cisco' else 'Juniper'}) detected dynamically.",
-                    }
+        # ── HUAWEI ROUTER INTERFACE DISCOVERY ──
+        elif router.vendor.lower() == 'huawei':
+            port_name_norm = _normalize_huawei_port(port_name)
+
+            with ConnectHandler(**_huawei_device_params(
+                router.loopback_ip, router.ssh_username, router.ssh_password
+            )) as conn:
+                conn.send_command_timing('screen-length 0 temporary', delay_factor=2)
+                raw_output = conn.send_command('display lldp neighbor brief', read_timeout=30)
+
+            for line in raw_output.splitlines():
+                line_clean = line.strip()
+                if not line_clean or 'Local Intf' in line_clean or '----' in line_clean:
+                    continue
+
+                parts = line_clean.split()
+                if len(parts) >= 3:
+                    local_intf = _normalize_huawei_port(parts[0])
+
+                    if local_intf.lower() == port_name_norm.lower():
+                        neighbor_name = parts[1].strip()
+                        neighbor_port = parts[2].strip()
+
+                        sw_ip     = "10.41.236.34"
+                        sw_vendor = 'juniper'
+
+                        sw_obj = Switch.objects.filter(name__iexact=neighbor_name).first()
+                        if sw_obj:
+                            sw_ip = sw_obj.loopback_ip
+                            if 'cisco' in sw_obj.model.lower():
+                                sw_vendor = 'cisco'
+                        else:
+                            rt_obj = Router.objects.filter(name__iexact=neighbor_name).first()
+                            if rt_obj:
+                                sw_ip = rt_obj.loopback_ip
+                                if 'cisco' in rt_obj.model.lower():
+                                    sw_vendor = 'cisco'
+
+                        return {
+                            'status':             'success',
+                            'has_switch':          True,
+                            'switch_name':        neighbor_name,
+                            'switch_ip':          sw_ip,
+                            'switch_port':        neighbor_port,
+                            'switch_uplink_port': neighbor_port,
+                            'switch_vendor':      sw_vendor,
+                            'message':            f"Switch {neighbor_name} detected dynamically on Huawei {router.name}.",
+                        }
 
         return {
             'status':     'success',
             'has_switch': False,
-            'message':    f"No switch detected via LLDP on port {port_name_norm}.",
+            'message':    f"No switch detected via LLDP on port {port_name}.",
         }
 
     except Exception as e:
@@ -1004,6 +1051,8 @@ def execute_internet_provisioning(self, task_id, router_id, port_id):
 
     finally:
         redis_client.delete(lock_key)
+
+
 # ============================================================
 # TASK 5 — LIBERATE PORT (undo internet provisioning)
 # ============================================================
@@ -1025,20 +1074,18 @@ def execute_port_liberation(self, task_id, router_id, port_id):
         raise self.retry(countdown=60, max_retries=3)
 
     try:
-        params   = task.parameters
-        vlan     = params.get('vlan')
-        vendor   = router.vendor.lower()
+        params    = task.parameters
+        vlan      = params.get('vlan')
+        vendor    = router.vendor.lower()
         port_name = _normalize_huawei_port(port.port_full_name)
 
-        # ── Build sub-interface name ──────────────────────────────────────
         if vlan and '.' not in port_name:
             sub_iface = f"{port_name}.{vlan}"
         else:
-            sub_iface = port_name   # already includes .VLAN
+            sub_iface = port_name
 
         vrf_name = params.get('vrf_name', 'Internet_vpn')
 
-        # ── HUAWEI ───────────────────────────────────────────────────────
         if vendor == 'huawei':
             output_lines = []
 
@@ -1050,11 +1097,8 @@ def execute_port_liberation(self, task_id, router_id, port_id):
                 time.sleep(3)
                 conn.read_channel()
 
-                # 1. Delete the sub-interface entirely — this removes IP, VRF
-                #    binding, QoS, description in one shot on VRP
                 _hw_send(conn, f'undo interface {sub_iface}', output_lines, sleep=3)
 
-                # 2. Reset physical interface description
                 _hw_send(conn, f'interface {port_name}', output_lines, sleep=2)
                 _hw_send(conn, 'undo description', output_lines)
                 _hw_send(conn, 'shutdown', output_lines)
@@ -1063,8 +1107,6 @@ def execute_port_liberation(self, task_id, router_id, port_id):
                 time.sleep(2)
                 conn.read_channel()
 
-                # 3. Remove static route if it exists
-                pe_ip           = params.get('pe_ip_address') or params.get('pe_ip', '')
                 ce_ip           = params.get('ce_ip_address') or params.get('ce_ip', '')
                 cust_lan_prefix = params.get('customer_lan_prefix', '')
                 nat_mode        = params.get('nat_mode', '')
@@ -1078,26 +1120,22 @@ def execute_port_liberation(self, task_id, router_id, port_id):
                         conn,
                         f'undo ip route-static vpn-instance {vrf_name} {cust_lan_prefix} {ce_ip}',
                         output_lines,
-                        check_error=False   # non-fatal if route didn't exist
+                        check_error=False
                     )
 
                 _hw_commit_save(conn, output_lines)
 
             execution_output = "\n".join(output_lines)
 
-        # ── JUNIPER ──────────────────────────────────────────────────────
         elif vendor == 'juniper':
             junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
             unit       = str(vlan) if vlan else '0'
 
             lines = [
-                # Remove the logical unit entirely
                 f'delete interfaces {junos_port} unit {unit}',
-                # Remove routing-instance binding
                 f'delete routing-instances INTERNET interface {junos_port}.{unit}',
             ]
 
-            # Remove static route if CPE mode
             nat_mode        = params.get('nat_mode', '')
             ce_ip           = params.get('ce_ip_address') or params.get('ce_ip', '')
             cust_lan_cidr   = params.get('customer_lan_cidr', '')
@@ -1119,10 +1157,8 @@ def execute_port_liberation(self, task_id, router_id, port_id):
         else:
             raise ValueError(f"Unsupported vendor: {router.vendor}")
 
-        # ── DB cleanup ───────────────────────────────────────────────────
         task.status        = 'liberated'
         task.result        = execution_output
-        task.script_output = ''
         task.save()
 
         port.admin_status     = 'available'

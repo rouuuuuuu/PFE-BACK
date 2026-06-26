@@ -9,29 +9,29 @@ class ProvisioningTask(models.Model):
         ('running',    'En cours'),
         ('completed',  'Terminé'),
         ('failed',     'Échoué'),
+        ('liberated',  'Libéré'),
     ]
 
     TYPE_CHOICES = [
-        ('backhaul', 'Backhaul Link'),
-        ('b2b',      'B2B Link'),
-        ('internet', 'Internet Service'),
-        ('voip',     'VoIP Service'),
-        ('mpls',     'MPLS'),
-        ('vpn',      'VPN'),
-        # --- NOUVEAUX CHOIX AJOUTÉS POUR ANGULAR ---
-        ('configure_vlan', 'Configure VLAN'),
-        ('firmware_upgrade', 'Firmware Upgrade'),
-        ('push_acl', 'Push ACL'),
+        ('backhaul',        'Backhaul Link'),
+        ('b2b',             'B2B Link'),
+        ('internet',        'Internet Service'),
+        ('voip',            'VoIP Service'),
+        ('mpls',            'MPLS'),
+        ('vpn',             'VPN'),
+        ('configure_vlan',  'Configure VLAN'),
+        ('firmware_upgrade','Firmware Upgrade'),
+        ('push_acl',        'Push ACL'),
     ]
 
     device_name    = models.CharField(max_length=100)
     device_ip      = models.GenericIPAddressField()
-    # max_length=20 est suffisant car "firmware_upgrade" fait 16 caractères
     task_type      = models.CharField(max_length=20, choices=TYPE_CHOICES)
     status         = models.CharField(max_length=20, choices=STATUS_CHOICES, default='queued')
     celery_task_id = models.CharField(max_length=100, blank=True)
     parameters     = models.JSONField(default=dict)
     result         = models.TextField(blank=True)
+    script_output  = models.TextField(blank=True, default='')
     created_at     = models.DateTimeField(auto_now_add=True)
     started_at     = models.DateTimeField(null=True, blank=True)
     completed_at   = models.DateTimeField(null=True, blank=True)
@@ -41,83 +41,79 @@ class ProvisioningTask(models.Model):
 
     class Meta:
         ordering = ['-created_at']
-    
-    
-# Add these imports at the top
-from devices.models import Router
 
-# Add this model class
+
 class BandwidthUpgrade(models.Model):
     """B2B Bandwidth Upgrade/Downgrade Task"""
-    
+
     STATUS_CHOICES = [
-        ('pending', 'En attente'),
+        ('pending',     'En attente'),
         ('in_progress', 'En cours'),
-        ('completed', 'Terminé'),
-        ('failed', 'Échec'),
+        ('completed',   'Terminé'),
+        ('failed',      'Échec'),
     ]
-    
+
     # Primary key
     upgrade_id = models.AutoField(primary_key=True)
-    
+
     # Device reference
     device = models.ForeignKey(
-        Router, 
-        on_delete=models.CASCADE, 
+        Router,
+        on_delete=models.CASCADE,
         related_name='bandwidth_upgrades'
     )
-    
+
     # Interface details
     interface = models.CharField(
         max_length=50,
         help_text="Interface name (e.g., GigabitEthernet0/0/1 or ge-0/0/1)"
     )
     vlan = models.CharField(
-        max_length=10, 
-        null=True, 
+        max_length=10,
+        null=True,
         blank=True,
         help_text="VLAN unit for Cisco/Juniper"
     )
-    
+
     # Customer info
     customer_name = models.CharField(max_length=200)
-    
+
     # Bandwidth change
     old_bandwidth_mbps = models.IntegerField(
-        null=True, 
+        null=True,
         blank=True,
         help_text="Previous bandwidth in Mbps"
     )
     new_bandwidth_mbps = models.IntegerField(
         help_text="New bandwidth in Mbps"
     )
-    
+
     # Task execution
     status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES, 
+        max_length=20,
+        choices=STATUS_CHOICES,
         default='pending'
     )
     celery_task_id = models.CharField(
-        max_length=255, 
-        null=True, 
+        max_length=255,
+        null=True,
         blank=True
     )
-    
+
     # Generated CLI output
     generated_commands = models.TextField(
         help_text="CLI commands that were/will be executed"
     )
     execution_output = models.TextField(
-        null=True, 
+        null=True,
         blank=True,
         help_text="SSH command output"
     )
-    
+
     # SWAN integration (optional)
-    swan_id = models.CharField(max_length=100, null=True, blank=True)
+    swan_id      = models.CharField(max_length=100, null=True, blank=True)
     swan_updated = models.BooleanField(default=False)
-    
+
     # Audit trail
     created_by = models.ForeignKey(
         'auth.User',
@@ -125,10 +121,10 @@ class BandwidthUpgrade(models.Model):
         null=True,
         related_name='created_upgrades'
     )
-    created_at = models.DateTimeField(auto_now_add=True)
-    started_at = models.DateTimeField(null=True, blank=True)
+    created_at   = models.DateTimeField(auto_now_add=True)
+    started_at   = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
-    
+
     class Meta:
         db_table = 'bandwidth_upgrades'
         ordering = ['-created_at']
@@ -137,10 +133,10 @@ class BandwidthUpgrade(models.Model):
             models.Index(fields=['status']),
             models.Index(fields=['created_at']),
         ]
-    
+
     def __str__(self):
         return f"Upgrade {self.upgrade_id} - {self.customer_name} ({self.new_bandwidth_mbps}Mbps)"
-    
+
     @property
     def is_upgrade(self):
         """True if bandwidth increased, False if decreased, None if old_bandwidth unknown"""
