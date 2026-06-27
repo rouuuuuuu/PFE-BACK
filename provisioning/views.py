@@ -12,6 +12,9 @@ from .tasks import (
     execute_bandwidth_upgrade,
     fetch_device_interfaces,
     execute_port_reservation,
+    execute_voip_provisioning,
+    execute_voip_liberation,
+    execute_port_liberation,
     execute_internet_provisioning,
     discover_switch_via_lldp,
 )
@@ -579,6 +582,170 @@ def liberate_port(request, task_id):
 
     job = execute_port_liberation.delay(task.id, router.id, port.id)
     return Response({'job_id': job.id, 'status': 'queued'})
+    
+    
+# ============================================================
+# PASTE THIS BLOCK AT THE BOTTOM OF views.py
+# Also add to the imports at the top of views.py:
+#
+#   from .tasks import (
+#       ...existing imports...,
+#       execute_voip_provisioning,
+#       execute_voip_liberation,
+#   )
+# ============================================================
+
+
+# ─────────────────────────────────────────────────────────────
+#  VOIP PROVISIONING — START
+# ─────────────────────────────────────────────────────────────
+class StartVoIPProvisioningView(APIView):
+    def post(self, request):
+        serializer = ProvisioningTaskSerializer(data=request.data)
+
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        device_name = serializer.validated_data.get('device_name')
+
+        try:
+            router = Router.objects.get(name__iexact=device_name)
+        except Router.DoesNotExist:
+            return Response(
+                {'error': f'Device "{device_name}" not found in database.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        task = serializer.save(device_ip=router.loopback_ip)
+
+        # Force task_type to 'voip' regardless of what was submitted
+        task.task_type = 'voip'
+
+        params = task.parameters if isinstance(task.parameters, dict) else {}
+
+        port_id = params.get('port_id')
+        if not port_id:
+            task.delete()
+            return Response(
+                {'error': 'port_id is required in parameters for VoIP provisioning.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Validate required VoIP-specific fields
+        pe_ip       = params.get('pe_ip_address') or params.get('pe_ip', '')
+        subnet_mask = params.get('subnet_mask', '')
+        vlan        = params.get('vlan')
+
+        if not pe_ip:
+            task.delete()
+            return Response(
+                {'error': '@IP GW (pe_ip_address) is required for VoIP provisioning.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not vlan:
+            task.delete()
+            return Response(
+                {'error': 'vlan is required for VoIP provisioning.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        task.parameters = params
+        task.save()
+
+        with transaction.atomic():
+            port = Port.objects.select_for_update().filter(
+                id=port_id,
+                ne_name=router.name,
+                admin_status='inactive',
+            ).first()
+
+            if not port:
+                task.status = 'failed'
+                task.result = 'Port is already in use or does not exist.'
+                task.save()
+                return Response(
+                    {'error': 'Port unavailable or already allocated.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            port.admin_status = 'pending_provisioning'
+            port.save()
+
+        def fire_voip_task():
+            celery_task = execute_voip_provisioning.delay(task.id, router.id, port.id)
+            ProvisioningTask.objects.filter(id=task.id).update(
+                celery_task_id=celery_task.id,
+                status='queued',
+            )
+
+        transaction.on_commit(fire_voip_task)
+
+        return Response(
+            {
+                'task_id': task.id,
+                'status':  'queued',
+                'message': f'VoIP provisioning queued for {router.name}',
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+#  VOIP PORT LIBERATION
+# ─────────────────────────────────────────────────────────────
+@api_view(['POST'])
+def liberate_voip_port(request, task_id):
+    from provisioning.models import ProvisioningTask
+    from devices.models import Port, Router
+
+    task = get_object_or_404(ProvisioningTask, id=task_id)
+
+    if task.task_type != 'voip':
+        return Response(
+            {'error': f'Task {task_id} is not a VoIP task (type={task.task_type}).'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if task.status not in ('completed', 'failed'):
+        return Response(
+            {'error': f'Task must be completed or failed to liberate. Current status: {task.status}'},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    params    = task.parameters if isinstance(task.parameters, dict) else {}
+    port_id   = params.get('port_id')
+    router_ip = task.device_ip
+
+    if not port_id:
+        return Response(
+            {'error': 'port_id not found in task parameters.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        router = Router.objects.get(loopback_ip=router_ip)
+    except Router.DoesNotExist:
+        return Response(
+            {'error': f'Router with IP {router_ip} not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        port = Port.objects.get(id=port_id)
+    except Port.DoesNotExist:
+        return Response(
+            {'error': f'Port {port_id} not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    job = execute_voip_liberation.delay(task.id, router.id, port.id)
+
+    return Response({
+        'job_id':  job.id,
+        'status':  'queued',
+        'message': f'VoIP liberation queued for port {port.port_full_name}',
+    })
 # ─────────────────────────────────────────────────────────────
 #  PROVISIONING TASKS — VIEWSET
 # ─────────────────────────────────────────────────────────────

@@ -1161,7 +1161,7 @@ def execute_port_liberation(self, task_id, router_id, port_id):
         task.result        = execution_output
         task.save()
 
-        port.admin_status     = 'available'
+        port.admin_status     = 'inactive'
         port.oper_status      = 'down'
         port.port_description = ''
         port.save()
@@ -1172,6 +1172,441 @@ def execute_port_liberation(self, task_id, router_id, port_id):
         logger.error(f"Liberation failed on {router.loopback_ip}: {str(e)}")
         task.status = 'failed'
         task.result = f"Liberation error: {str(e)}"
+        task.save()
+        raise e
+
+    finally:
+        redis_client.delete(lock_key)
+        
+# ============================================================
+# PASTE THIS BLOCK AT THE BOTTOM OF tasks.py
+# (after execute_port_liberation, before the end of the file)
+# ============================================================
+
+
+# ============================================================
+# VOIP HELPERS
+# ============================================================
+
+def _mask_to_cidr(subnet_mask: str) -> str:
+    """
+    Converts dotted subnet mask to CIDR prefix length.
+    e.g. '255.255.255.252' -> '/30'
+    """
+    mask_map = {
+        '255.255.255.0':   '/24',
+        '255.255.255.128': '/25',
+        '255.255.255.192': '/26',
+        '255.255.255.224': '/27',
+        '255.255.255.240': '/28',
+        '255.255.255.248': '/29',
+        '255.255.255.252': '/30',
+        '255.255.255.254': '/31',
+    }
+    return mask_map.get(subnet_mask, '/30')
+
+
+def build_voip_payload(port_name, params, router=None):
+    """
+    Builds the Jinja2 context dict for VoIP provisioning.
+    Simpler than build_provisioning_payload:
+      - No CIDR auto-derivation (PE IP entered directly)
+      - No NAT mode
+      - No QoS shaping
+      - No static route
+      - VRF hardcoded to Voice_vpn
+    """
+    port_name = _normalize_huawei_port(port_name)
+
+    media_type   = params.get('media_type', 'fo').lower()
+    subnet_mask  = params.get('subnet_mask', '255.255.255.252')
+    subnet_cidr  = _mask_to_cidr(subnet_mask)
+
+    # Switch topology — same logic as internet
+    has_switch    = params.get('has_switch', False)
+    switch_ip     = params.get('switch_ip')
+    switch_uplink = params.get('switch_uplink_port', 'ge-0/1/0')
+    switch_port   = params.get('switch_port')
+    switch_vendor = params.get('switch_vendor', 'juniper')
+
+    if has_switch and not switch_ip and router:
+        sw = find_switch_for_port(router, port_name)
+        if sw:
+            switch_ip     = sw.loopback_ip
+            switch_uplink = getattr(sw, 'interface_sw', 'ge-0/1/0')
+            switch_port   = getattr(sw, 'interface_sw', '')
+            switch_vendor = 'cisco' if 'cisco' in getattr(sw, 'model', '').lower() else 'juniper'
+
+    # PE IP — entered directly from the form (@IP GW field)
+    pe_ip = params.get('pe_ip_address') or params.get('pe_ip') or ''
+    if not pe_ip:
+        raise ValueError(
+            "PE IP address (@IP GW) is required for VoIP provisioning."
+        )
+
+    return {
+        'client_name':        params.get('client_name', 'Unknown'),
+        'port_name':          port_name,
+        'vlan':               params.get('vlan'),
+        'media_type':         media_type.upper(),
+        'pe_ip':              pe_ip,
+        'subnet_mask':        subnet_mask,
+        'subnet_cidr':        subnet_cidr,
+        'vrf_name':           'Voice_vpn',
+        'has_switch':         has_switch,
+        'switch_ip':          switch_ip,
+        'switch_port':        switch_port,
+        'switch_uplink_port': switch_uplink,
+        'switch_vendor':      switch_vendor,
+        'is_bundle': (
+            port_name.startswith('Eth-Trunk')
+            or port_name.lower().startswith('ae')
+        ),
+    }
+
+
+# ============================================================
+# VOIP VENDOR DRIVERS
+# ============================================================
+
+class HuaweiVoIPDriver(ProvisioningDriver):
+    """
+    Huawei NE40E VoIP sub-interface provisioning.
+    No QoS shaping, no static route, VRF = Voice_vpn.
+    """
+
+    PHYS_TEMPLATE = (
+        "interface {{ port_name }}\n"
+        " description TO_VOIP_client_{{ client_name }}_{{ media_type }}\n"
+        " undo shutdown"
+    )
+
+    SUB_TEMPLATE = (
+        "interface {{ port_name }}.{{ vlan }}\n"
+        " vlan-type dot1q {{ vlan }}\n"
+        " description TO_VOIP_client_{{ client_name }}_{{ media_type }}\n"
+        " ip binding vpn-instance {{ vrf_name }}\n"
+        " ip address {{ pe_ip }} {{ subnet_mask }}\n"
+        " statistic enable"
+    )
+
+    # Lab template — creates the VPN instance first (safe to run in EVE-NG)
+    LAB_SUB_TEMPLATE = (
+        "ip vpn-instance {{ vrf_name }}\n"
+        " route-distinguisher 200:1\n"
+        " vpn-target 200:1 both\n"
+        "quit\n"
+        "interface {{ port_name }}.{{ vlan }}\n"
+        "vlan-type dot1q {{ vlan }}\n"
+        "description TO_VOIP_client_{{ client_name }}_{{ media_type }}\n"
+        "ip binding vpn-instance {{ vrf_name }}\n"
+        "ip address {{ pe_ip }} {{ subnet_mask }}\n"
+        "statistic enable"
+    )
+
+    def generate_config(self, payload) -> dict:
+        has_switch = payload.get('has_switch', False)
+
+        phys_lines = []
+        if not has_switch:
+            phys_lines = Template(self.PHYS_TEMPLATE).render(payload).splitlines()
+
+        prod_sub_lines = Template(self.SUB_TEMPLATE).render(payload).splitlines()
+        lab_sub_lines  = Template(self.LAB_SUB_TEMPLATE).render(payload).splitlines()
+
+        return {
+            'phys_lines':     phys_lines,
+            'prod_sub_lines': prod_sub_lines,
+            'lab_sub_lines':  lab_sub_lines,
+        }
+
+    def execute(self, config_data) -> str:
+        output_lines = []
+
+        with ConnectHandler(**_huawei_device_params(
+            self.host, self.username, self.password
+        )) as conn:
+
+            conn.write_channel('system-view\n')
+            time.sleep(3)
+            conn.read_channel()
+
+            # Physical interface (undo shutdown + description)
+            if config_data['phys_lines']:
+                phys_cmds = [l.strip() for l in config_data['phys_lines'] if l.strip()]
+                _hw_send(conn, phys_cmds[0], output_lines, sleep=3)
+                for cmd in phys_cmds[1:]:
+                    _hw_send(conn, cmd, output_lines)
+                conn.write_channel('quit\n')
+                time.sleep(2)
+                conn.read_channel()
+
+            # Sub-interface + VRF binding
+            lab_cmds = [l.strip() for l in config_data['lab_sub_lines'] if l.strip()]
+            _hw_send(conn, lab_cmds[0], output_lines, sleep=3)
+            for cmd in lab_cmds[1:]:
+                _hw_send(conn, cmd, output_lines)
+
+            conn.write_channel('quit\n')
+            time.sleep(2)
+            conn.read_channel()
+
+            _hw_commit_save(conn, output_lines)
+
+        return "\n".join(output_lines)
+
+    def render_script(self, payload, router_ip='') -> str:
+        cfg   = self.generate_config(payload)
+        parts = [
+            "==> port dédié sur RT Huawei VoIP",
+            "",
+            f"<{router_ip}>",
+            "",
+        ]
+
+        if cfg['phys_lines']:
+            parts.append('\n'.join(cfg['phys_lines']))
+            parts.append('')
+
+        parts.append('\n'.join(cfg['prod_sub_lines']))
+        return '\n'.join(parts)
+
+
+class JuniperVoIPDriver(ProvisioningDriver):
+    """
+    Juniper vJunos VoIP sub-interface provisioning.
+    No CoS shaping, routing-instance = VOIP, VRF = Voice_vpn equivalent.
+    """
+
+    TEMPLATE = (
+        "delete interfaces {{ junos_port }} unit 0\n"
+        "set interfaces {{ junos_port }} vlan-tagging\n"
+        "set interfaces {{ junos_port }} flexible-vlan-tagging\n"
+        "set interfaces {{ junos_port }} per-unit-scheduler\n"
+        "set interfaces {{ junos_port }} unit {{ vlan }} "
+        "description \"B2B_VOIP_{{ media_type }}_{{ client_name }}\"\n"
+        "set interfaces {{ junos_port }} unit {{ vlan }} vlan-id {{ vlan }}\n"
+        "set interfaces {{ junos_port }} unit {{ vlan }} "
+        "family inet address {{ pe_ip }}{{ subnet_cidr }}\n"
+        "set routing-instances VOIP interface {{ junos_port }}.{{ vlan }}"
+    )
+
+    def generate_config(self, payload) -> str:
+        port_name  = payload['port_name']
+        junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
+        return Template(self.TEMPLATE).render({**payload, 'junos_port': junos_port})
+
+    def execute(self, config_string) -> str:
+        return _juniper_push(self.host, self.username, self.password, config_string)
+
+    def render_script(self, payload, router_ip='') -> str:
+        return self.generate_config(payload)
+
+
+def get_voip_vendor_driver(vendor, host, username, password):
+    drivers = {
+        'huawei':  HuaweiVoIPDriver,
+        'juniper': JuniperVoIPDriver,
+    }
+    cls = drivers.get(vendor.lower())
+    if not cls:
+        raise ValueError(f"Unsupported vendor for VoIP: {vendor}")
+    return cls(host, username, password)
+
+
+# ============================================================
+# TASK 6 — VOIP PROVISIONING
+# ============================================================
+
+@shared_task(bind=True)
+def execute_voip_provisioning(self, task_id, router_id, port_id):
+    from devices.models import Router, Port
+    from provisioning.models import ProvisioningTask
+
+    try:
+        task   = ProvisioningTask.objects.get(id=task_id)
+        router = Router.objects.get(id=router_id)
+        port   = Port.objects.get(id=port_id)
+    except Exception:
+        return "Database records not found."
+
+    payload  = build_voip_payload(port.port_full_name, task.parameters, router=router)
+    lock_key = f'device_lock_{router.loopback_ip}'
+
+    if not redis_client.set(lock_key, f"voip_task_{task_id}", nx=True, ex=300):
+        raise self.retry(countdown=60, max_retries=3)
+
+    try:
+        task.status = 'running'
+        task.save()
+
+        script_parts = []
+
+        # ── Optional switch provisioning (same logic as internet) ──
+        if payload.get('has_switch') and payload.get('switch_ip'):
+            sw_ip     = payload['switch_ip']
+            sw_vendor = payload.get('switch_vendor', 'juniper')
+
+            try:
+                from devices.models import Switch
+                sw = Switch.objects.get(loopback_ip=sw_ip)
+                if 'cisco' in getattr(sw, 'model', '').lower():
+                    sw_vendor = 'cisco'
+            except Exception:
+                logger.warning(f"Switch {sw_ip} not found in Switch model.")
+
+            sw_username = router.ssh_username
+            sw_password = router.ssh_password
+
+            if sw_vendor == 'cisco':
+                sw_driver = CiscoSwitchDriver(sw_ip, sw_username, sw_password)
+            else:
+                sw_driver = JuniperSwitchDriver(sw_ip, sw_username, sw_password)
+
+            sw_config = sw_driver.generate_config(payload)
+            sw_output = sw_driver.execute(sw_config)
+            logger.info(f"Switch {sw_ip} provisioned for VoIP: {sw_output}")
+
+            script_parts.append(
+                f"==> port sur sw VoIP\n\n"
+                f"<{sw_ip}>\n"
+                f"{sw_driver.render_script(payload)}"
+            )
+
+        # ── PE provisioning ──
+        pe_driver = get_voip_vendor_driver(
+            router.vendor,
+            router.loopback_ip,
+            router.ssh_username,
+            router.ssh_password,
+        )
+
+        config_data      = pe_driver.generate_config(payload)
+        execution_output = pe_driver.execute(config_data)
+
+        if payload.get('has_switch'):
+            script_parts.append(
+                f"\n<{router.loopback_ip}>\n"
+                f"{pe_driver.render_script(payload, router_ip=router.loopback_ip).split(chr(10), 4)[-1]}"
+            )
+        else:
+            script_parts.append(
+                pe_driver.render_script(payload, router_ip=router.loopback_ip)
+            )
+
+        task.status        = 'completed'
+        task.result        = execution_output
+        task.script_output = '\n'.join(script_parts)
+        task.save()
+
+        port.admin_status     = 'active'
+        port.port_description = (
+            f"TO_VOIP_client_{payload['client_name']}_{payload['media_type']}"
+        )
+        port.save()
+
+        return f"VoIP provisioned for {payload['client_name']}"
+
+    except Exception as e:
+        logger.error(f"VoIP provisioning failed on {router.loopback_ip}: {str(e)}")
+        task.status = 'failed'
+        task.result = str(e)
+        task.save()
+        raise e
+
+    finally:
+        redis_client.delete(lock_key)
+
+
+# ============================================================
+# TASK 7 — LIBERATE VOIP PORT (undo voip provisioning)
+# ============================================================
+
+@shared_task(bind=True)
+def execute_voip_liberation(self, task_id, router_id, port_id):
+    from devices.models import Router, Port
+    from provisioning.models import ProvisioningTask
+
+    try:
+        task   = ProvisioningTask.objects.get(id=task_id)
+        router = Router.objects.get(id=router_id)
+        port   = Port.objects.get(id=port_id)
+    except Exception as e:
+        return f"DB record not found: {e}"
+
+    lock_key = f'device_lock_{router.loopback_ip}'
+    if not redis_client.set(lock_key, f"voip_liberation_{task_id}", nx=True, ex=300):
+        raise self.retry(countdown=60, max_retries=3)
+
+    try:
+        params    = task.parameters
+        vlan      = params.get('vlan')
+        vendor    = router.vendor.lower()
+        port_name = _normalize_huawei_port(port.port_full_name)
+
+        if vlan and '.' not in port_name:
+            sub_iface = f"{port_name}.{vlan}"
+        else:
+            sub_iface = port_name
+
+        if vendor == 'huawei':
+            output_lines = []
+
+            with ConnectHandler(**_huawei_device_params(
+                router.loopback_ip, router.ssh_username, router.ssh_password
+            )) as conn:
+
+                conn.write_channel('system-view\n')
+                time.sleep(3)
+                conn.read_channel()
+
+                # Delete the VoIP sub-interface
+                _hw_send(conn, f'undo interface {sub_iface}', output_lines, sleep=3)
+
+                # Shutdown and clear description on the physical port
+                _hw_send(conn, f'interface {port_name}', output_lines, sleep=2)
+                _hw_send(conn, 'undo description', output_lines)
+                _hw_send(conn, 'shutdown', output_lines)
+
+                conn.write_channel('quit\n')
+                time.sleep(2)
+                conn.read_channel()
+
+                _hw_commit_save(conn, output_lines)
+
+            execution_output = "\n".join(output_lines)
+
+        elif vendor == 'juniper':
+            junos_port = port_name[:-2] if port_name.endswith('.0') else port_name
+            unit       = str(vlan) if vlan else '0'
+
+            config_string = '\n'.join([
+                f'delete interfaces {junos_port} unit {unit}',
+                f'delete routing-instances VOIP interface {junos_port}.{unit}',
+            ])
+
+            execution_output = _juniper_push(
+                router.loopback_ip, router.ssh_username, router.ssh_password, config_string
+            )
+
+        else:
+            raise ValueError(f"Unsupported vendor: {router.vendor}")
+
+        task.status = 'liberated'
+        task.result = execution_output
+        task.save()
+
+        port.admin_status     = 'inactive'
+        port.oper_status      = 'down'
+        port.port_description = ''
+        port.save()
+
+        return f"VoIP port {port.port_full_name} liberated successfully."
+
+    except Exception as e:
+        logger.error(f"VoIP liberation failed on {router.loopback_ip}: {str(e)}")
+        task.status = 'failed'
+        task.result = f"VoIP liberation error: {str(e)}"
         task.save()
         raise e
 

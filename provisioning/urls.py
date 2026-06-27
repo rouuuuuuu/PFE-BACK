@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import StartProvisioningView, ProvisioningStatusView, ProvisioningTaskViewSet, reserve_port, fetch_switch_for_port
+from .views import StartProvisioningView, ProvisioningStatusView, ProvisioningTaskViewSet, reserve_port, fetch_switch_for_port, StartVoIPProvisioningView, liberate_voip_port
 from . import views
 
 router = DefaultRouter()
@@ -21,4 +21,6 @@ urlpatterns = [
     path('fetch-switch/', fetch_switch_for_port, name='fetch-switch'), # <-- AJOUTE CETTE LIGNE
     path('reserve-port/', reserve_port, name='reserve-port'),
     path('port-reservations/', views.list_port_reservations, name='list-port-reservations'),
+    path('voip/start/',StartVoIPProvisioningView.as_view(), name='voip-start'),
+    path('voip/liberate/<int:task_id>/', liberate_voip_port, name='voip-liberate'),
 ]
