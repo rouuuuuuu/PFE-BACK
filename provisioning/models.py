@@ -1,5 +1,7 @@
 from django.db import models
 from devices.models import Router
+from django.conf import settings
+
 
 
 class ProvisioningTask(models.Model):
@@ -116,11 +118,13 @@ class BandwidthUpgrade(models.Model):
 
     # Audit trail
     created_by = models.ForeignKey(
-        'auth.User',
-        on_delete=models.SET_NULL,
-        null=True,
-        related_name='created_upgrades'
+    settings.AUTH_USER_MODEL,
+    null=True,
+    blank=True,
+    on_delete=models.SET_NULL,
     )
+
+   
     created_at   = models.DateTimeField(auto_now_add=True)
     started_at   = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)

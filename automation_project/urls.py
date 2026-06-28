@@ -18,6 +18,7 @@ urlpatterns = [
     path('api/backhaul/', include('backhaul.urls')),
     path('api/', include('devices.urls')),
     path('api/provisioning/', include('provisioning.urls')),
+    path('api/auth/', include('accounts.urls')),
     
     # FIXED: Changed from 'api/reporting/' to 'api/reports/' to match frontend
     path('api/reports/', include('reporting.urls')), 
