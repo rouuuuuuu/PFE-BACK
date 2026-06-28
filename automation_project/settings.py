@@ -164,5 +164,6 @@ STATIC_URL = 'static/'
 # ── Default PK ──
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# ── Groq ──
-GROQ_API_KEY = "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"
+# Configuration OpenRouter pour l'analyse d'alarmes / tâches IA
+OPENROUTER_API_KEY = "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"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"

@@ -85,8 +85,8 @@ def password_reset_request(request):
         <table width="500" cellpadding="0" cellspacing="0" style="background-color:#1a1a1a;border-radius:12px;overflow:hidden;border:1px solid #333;">
           <tr>
             <td style="background-color:#ff6600;padding:30px;text-align:center;">
-              <h1 style="color:#ffffff;margin:0;font-size:24px;letter-spacing:2px;">DRS010</h1>
-              <p style="color:#ffe0cc;margin:5px 0 0;font-size:13px;">Orange Tunisia — Network Automation</p>
+              <h1 style="color:#ffffff;margin:0;font-size:24px;letter-spacing:2px;">OrangNOC</h1>
+              <p style="color:#ffe0cc;margin:5px 0 0;font-size:13px;">Orange Tunisia — Network Operating Center</p>
             </td>
           </tr>
           <tr>

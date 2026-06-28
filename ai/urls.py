@@ -6,6 +6,7 @@ app_name = "ai_assistant"
 urlpatterns = [
     # On garde l'endpoint des statistiques du tableau de bord
     path("stats/", views.ai_stats, name="stats"),
+    path('chat/', views.ai_chat_local_scratch, name='ai_chat'),
 
     # On utilise uniquement le chat local "From Scratch"
     path("chat/native/", views.ai_chat_local_scratch, name="chat_native"),
