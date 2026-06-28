@@ -15,6 +15,8 @@ from .tasks import (
     execute_voip_provisioning,
     execute_voip_liberation,
     execute_port_liberation,
+    execute_l2vc_provisioning,
+    execute_l2vc_liberation,
     execute_internet_provisioning,
     discover_switch_via_lldp,
 )
@@ -745,6 +747,152 @@ def liberate_voip_port(request, task_id):
         'job_id':  job.id,
         'status':  'queued',
         'message': f'VoIP liberation queued for port {port.port_full_name}',
+    })
+    
+# ─────────────────────────────────────────────────────────────
+#  L2VC PROVISIONING — START
+# ─────────────────────────────────────────────────────────────
+class StartL2VCProvisioningView(APIView):
+    def post(self, request):
+        serializer = ProvisioningTaskSerializer(data=request.data)
+
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        device_name = serializer.validated_data.get('device_name')
+
+        try:
+            router = Router.objects.get(name__iexact=device_name)
+        except Router.DoesNotExist:
+            return Response(
+                {'error': f'Device "{device_name}" not found in database.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        task           = serializer.save(device_ip=router.loopback_ip)
+        task.task_type = 'l2vc'
+
+        params  = task.parameters if isinstance(task.parameters, dict) else {}
+        port_id = params.get('port_id')
+        vlan    = params.get('vlan')
+
+        if not port_id:
+            task.delete()
+            return Response(
+                {'error': 'port_id is required for L2VC provisioning.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not vlan:
+            task.delete()
+            return Response(
+                {'error': 'vlan is required for L2VC provisioning.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        remote_device_name = params.get('remote_device_name', '')
+        if not remote_device_name and not params.get('peer_ip'):
+            task.delete()
+            return Response(
+                {'error': 'remote_device_name or peer_ip is required for L2VC provisioning.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        task.parameters = params
+        task.save()
+
+        with transaction.atomic():
+            port = Port.objects.select_for_update().filter(
+                id=port_id,
+                ne_name=router.name,
+                admin_status='inactive',
+            ).first()
+
+            if not port:
+                task.status = 'failed'
+                task.result = 'Port is already in use or does not exist.'
+                task.save()
+                return Response(
+                    {'error': 'Port unavailable or already allocated.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            port.admin_status = 'pending_provisioning'
+            port.save()
+
+        def fire_l2vc_task():
+            celery_task = execute_l2vc_provisioning.delay(task.id, router.id, port.id)
+            ProvisioningTask.objects.filter(id=task.id).update(
+                celery_task_id=celery_task.id,
+                status='queued',
+            )
+
+        transaction.on_commit(fire_l2vc_task)
+
+        return Response(
+            {
+                'task_id': task.id,
+                'status':  'queued',
+                'message': f'L2VC provisioning queued for {router.name}',
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+#  L2VC PORT LIBERATION
+# ─────────────────────────────────────────────────────────────
+@api_view(['POST'])
+def liberate_l2vc_port(request, task_id):
+    from provisioning.models import ProvisioningTask
+    from devices.models import Port, Router
+
+    task = get_object_or_404(ProvisioningTask, id=task_id)
+
+    if task.task_type != 'l2vc':
+        return Response(
+            {'error': f'Task {task_id} is not an L2VC task (type={task.task_type}).'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if task.status not in ('completed', 'failed'):
+        return Response(
+            {'error': f'Task must be completed or failed to liberate. Current status: {task.status}'},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    params    = task.parameters if isinstance(task.parameters, dict) else {}
+    port_id   = params.get('port_id')
+    router_ip = task.device_ip
+
+    if not port_id:
+        return Response(
+            {'error': 'port_id not found in task parameters.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        router = Router.objects.get(loopback_ip=router_ip)
+    except Router.DoesNotExist:
+        return Response(
+            {'error': f'Router with IP {router_ip} not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        port = Port.objects.get(id=port_id)
+    except Port.DoesNotExist:
+        return Response(
+            {'error': f'Port {port_id} not found.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    job = execute_l2vc_liberation.delay(task.id, router.id, port.id)
+
+    return Response({
+        'job_id':  job.id,
+        'status':  'queued',
+        'message': f'L2VC liberation queued for port {port.port_full_name}',
     })
 # ─────────────────────────────────────────────────────────────
 #  PROVISIONING TASKS — VIEWSET

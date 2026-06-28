@@ -20,6 +20,7 @@ class ProvisioningTask(models.Model):
         ('internet',        'Internet Service'),
         ('voip',            'VoIP Service'),
         ('mpls',            'MPLS'),
+        ('l2vc',            'L2VC Service'),
         ('vpn',             'VPN'),
         ('configure_vlan',  'Configure VLAN'),
         ('firmware_upgrade','Firmware Upgrade'),
